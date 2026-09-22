@@ -1,0 +1,10 @@
+# Build output - regenerated on every build, no need to version
+bin/
+obj/
+
+# Visual Studio
+.vs/
+*.user
+
+# Run logs - regenerated on every run
+GUIAutomationLog_*.txt
