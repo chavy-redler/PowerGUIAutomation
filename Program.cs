@@ -52,6 +52,7 @@ while (true)
         Console.WriteLine();
         Console.WriteLine("=== Power GUI Automation ===");
         Console.WriteLine("1. Operate - Second Bar (unit info bar) comparison");
+        Console.WriteLine("2. Configure - Parameters comparison");
         Console.WriteLine("0. Exit");
         Console.Write("Choice: ");
         choice = Console.ReadLine();
@@ -73,6 +74,18 @@ while (true)
                 var test = new OperateSecondBarTest(ExcelPath, Log);
                 bool passed = test.Run();
                 Log(passed ? "=== TEST PASSED ===" : "=== TEST FAILED ===");
+            }
+            catch (Exception ex)
+            {
+                Log("FAIL | Unhandled error: " + ex.Message);
+            }
+            break;
+        case "2":
+            try
+            {
+                var configureTest = new ConfigureParametersTest(ExcelPath, Log);
+                bool configurePassed = configureTest.Run();
+                Log(configurePassed ? "=== TEST PASSED ===" : "=== TEST FAILED ===");
             }
             catch (Exception ex)
             {
