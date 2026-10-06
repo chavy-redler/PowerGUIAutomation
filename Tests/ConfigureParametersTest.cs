@@ -22,19 +22,34 @@ public class ConfigureParametersTest
 
     private readonly string _excelPath;
     private readonly Action<string> _log;
+    private readonly string[] _sheetNames;
+    private readonly UnitProfile? _unit;
     private static readonly Regex AutomationIdRegex = new(@"automationid='([^']+)'", RegexOptions.IgnoreCase);
     private static readonly Regex BracketedRegex = new(@"^\[\s*([^,\]]+?)\s*[,\]]");
 
-    public ConfigureParametersTest(string excelPath, Action<string> log)
+    public ConfigureParametersTest(string excelPath, Action<string> log, string[]? sheetNames = null, UnitProfile? unit = null)
     {
         _excelPath = excelPath;
         _log = log;
+        _unit = unit;
+        _sheetNames = sheetNames ?? new[] { "System Parameters", "Channel Parameters" };
     }
 
     public bool Run()
     {
         using var automation = new UIA3Automation();
         var mainWindow = AppConnection.Attach(automation);
+
+        if (_unit != null)
+        {
+            string? unitProblem = UnitCheck.Verify(mainWindow, _unit, _log);
+            if (unitProblem != null)
+            {
+                _log("FAIL  | (test setup) | STEP: check the connected unit | WHY: " + unitProblem + " | CHECK: connect the unit '" + _unit.Name + "' or choose the right unit (U in the main menu)");
+                return false;
+            }
+        }
+
         AppConnection.GoToTab(mainWindow, "ConfigureTab");
 
         var searchBoxElement = mainWindow.FindFirstDescendant(cf => cf.ByAutomationId("searchTextBox"));
@@ -128,7 +143,13 @@ public class ConfigureParametersTest
                 // something non-empty or run out of attempts.
                 for (int attempt = 1; attempt <= MaxFindRetries; attempt++)
                 {
-                    valueElement.Focus();
+                    // Text boxes need Focus() before their value can be read, but a ComboBox is read as it is: focusing it
+                    // (a click into the field) can blank the text it displays (seen on "Digital Output 1 Logic Control").
+                    if (valueElement.ControlType != ControlType.ComboBox)
+                    {
+                        valueElement.Focus();
+                    }
+
                     Thread.Sleep(300);
 
                     string candidate = "";
@@ -140,6 +161,23 @@ public class ConfigureParametersTest
                     {
                         var comboBox = valueElement.AsComboBox();
                         candidate = (comboBox.SelectedItem?.Text ?? "").Trim();
+                    }
+
+                    // A ComboBox can answer ValuePattern with "" although an item IS selected (the selection is then only in
+                    // SelectedItem or in the text shown inside the control) - try those before giving up.
+                    if (candidate.Length == 0 && valueElement.ControlType == ControlType.ComboBox)
+                    {
+                        var selected = valueElement.AsComboBox().SelectedItem;
+                        candidate = (selected?.Name ?? "").Trim();
+                        if (candidate.Length == 0)
+                        {
+                            candidate = (selected?.Text ?? "").Trim();
+                        }
+
+                        if (candidate.Length == 0)
+                        {
+                            candidate = RawTexts(valueElement).FirstOrDefault(t => t.Length > 0) ?? "";
+                        }
                     }
 
                     if (candidate.Length > 0)
@@ -155,6 +193,26 @@ public class ConfigureParametersTest
 
                     Thread.Sleep(RetryDelayMs);
                 }
+            }
+
+            // Logic-expression parameters ("Digital Output 1 Logic Control", ...) have an EDITOR text box that is empty by design
+            // (clicking into it shows an empty field) and show the current expression in a separate Text of the same row. The user
+            // sees that Text, so it is the value to compare.
+            if (valueElement != null && actualValue.Length == 0)
+            {
+                string displayed = ReadDisplayedText(nameElement, valueElement);
+                if (displayed.Length > 0)
+                {
+                    actualValue = displayed;
+                    _log("NOTE  | Row " + excelRow + " | the value control is an empty editor - using the text DISPLAYED in the row: '" + displayed + "'");
+                }
+            }
+
+            if (valueElement != null && actualValue.Length == 0)
+            {
+                _log("NOTE  | Row " + excelRow + " | the value control reads EMPTY: control=" + valueElement.ControlType + " class=" + valueElement.ClassName
+                     + " | ValuePattern=" + (valueElement.Patterns.Value.IsSupported ? "supported (empty)" : "not supported")
+                     + " | the GUI shows no value for '" + expectedName + "' (Excel expects '" + expectedValue + "')");
             }
 
             // Some ComboBox-backed parameters expose their raw bound object
@@ -199,6 +257,49 @@ public class ConfigureParametersTest
         return fail == 0;
     }
 
+    // The visible Text of the parameter's row that is neither the parameter name nor a unit/description: what the user reads as the value.
+    private static string ReadDisplayedText(AutomationElement nameElement, AutomationElement valueElement)
+    {
+        try
+        {
+            string paramName = (nameElement.Name ?? "").Trim();
+            var row = valueElement.Parent;
+            if (row == null)
+            {
+                return "";
+            }
+
+            return RawTexts(row, 3)
+                .Select(t => t.Trim())
+                .FirstOrDefault(t => t.Length > 0 && t.Length < 80 && t != paramName && !t.StartsWith("[") && !Regex.IsMatch(t, @"^\d+ / \d+$")) ?? "";
+        }
+        catch
+        {
+            return "";
+        }
+    }
+
+    // Texts inside a control, read from the raw UIA tree (the displayed value of a ComboBox is such a child Text).
+    private static IEnumerable<string> RawTexts(AutomationElement root, int depth = 0)
+    {
+        var walker = root.Automation.TreeWalkerFactory.GetRawViewWalker();
+        for (var c = walker.GetFirstChild(root); c != null; c = walker.GetNextSibling(c))
+        {
+            if (c.ControlType == ControlType.Text)
+            {
+                yield return (c.Name ?? "").Trim();
+            }
+
+            if (depth < 6)
+            {
+                foreach (var t in RawTexts(c, depth + 1))
+                {
+                    yield return t;
+                }
+            }
+        }
+    }
+
     private static AutomationElement? FindWithRetry(FlaUI.Core.AutomationElements.Window window, string automationId)
     {
         for (int attempt = 1; attempt <= MaxFindRetries; attempt++)
@@ -225,7 +326,7 @@ public class ConfigureParametersTest
         using var workbook = new XLWorkbook(_excelPath);
         var result = new List<(string, string, string, string, string)>();
 
-        foreach (var sheetName in new[] { "System Parameters", "Channel Parameters" })
+        foreach (var sheetName in _sheetNames)
         {
             if (!workbook.Worksheets.Contains(sheetName))
             {
