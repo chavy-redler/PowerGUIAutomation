@@ -24,10 +24,12 @@ public class ConfigureParametersTest
     private readonly Action<string> _log;
     private readonly string[] _sheetNames;
     private readonly UnitProfile? _unit;
+    private readonly Func<int, string, bool>? _rowFilter;     // debug runs: (channel, parameter name) -> run this row?
     private static readonly Regex BracketedRegex = new(@"^\[\s*([^,\]]+?)\s*[,\]]");
 
-    public ConfigureParametersTest(string excelPath, Action<string> log, string[]? sheetNames = null, UnitProfile? unit = null)
+    public ConfigureParametersTest(string excelPath, Action<string> log, string[]? sheetNames = null, UnitProfile? unit = null, Func<int, string, bool>? rowFilter = null)
     {
+        _rowFilter = rowFilter;
         _excelPath = excelPath;
         _log = log;
         _unit = unit;
@@ -71,6 +73,17 @@ public class ConfigureParametersTest
             return false;
         }
 
+        if (_rowFilter != null)
+        {
+            dataRows = dataRows.Where(r => _rowFilter(r.channel, r.expectedName)).ToList();
+            _log("INFO  | debug filter active: " + dataRows.Count + " rows will be checked");
+            if (dataRows.Count == 0)
+            {
+                _log("FAIL  | the filter matched no rows");
+                return false;
+            }
+        }
+
         int pass = 0, fail = 0, skip = 0;
 
         foreach (var (excelRow, parameterPath, expectedName, valuePath, expectedValue, channel) in dataRows)
@@ -102,10 +115,33 @@ public class ConfigureParametersTest
             Keyboard.TypeSimultaneously(VirtualKeyShort.CONTROL, VirtualKeyShort.KEY_V);
 
             var nameElement = FindWithRetry(mainWindow, nameAutomationId);
+            string where = "";       // what the GUI itself says is displayed (breadcrumb + result counter) - proof of WHICH channel was compared
             if (nameElement != null && channel > 0)
             {
                 // the search shows ONE result at a time (1 of 16 matches): step to the wanted channel
-                nameElement = GoToChannel(mainWindow, nameAutomationId, channel) ?? nameElement;
+                var (channelElement, crumb, counter) = GoToChannel(mainWindow, nameAutomationId, channel);
+                if (channelElement == null)
+                {
+                    // never fall back to the first result (another channel): that would compare the wrong channel's value
+                    _log("FAIL  | Row " + excelRow + " | Expected='" + expectedName + "' | could not reach 'Channel " + channel + " Parameters' - breadcrumb of the last result: '" + crumb + "' " + counter);
+                    _log("STOPPED | halted after first mismatch - remaining parameters were not checked");
+                    return false;
+                }
+
+                nameElement = channelElement;
+                where = " | Ch" + channel + " | breadcrumb='" + crumb + "' " + counter;
+            }
+            else if (nameElement != null)
+            {
+                string crumb = ReadBreadcrumb(mainWindow);
+                if (Regex.IsMatch(crumb, @"Channel \d+ Parameters"))
+                {
+                    _log("FAIL  | Row " + excelRow + " | Expected='" + expectedName + "' | a SYSTEM parameter was expected but the GUI shows a channel result: '" + crumb + "'");
+                    _log("STOPPED | halted after first mismatch - remaining parameters were not checked");
+                    return false;
+                }
+
+                where = " | System | breadcrumb='" + crumb + "' " + ReadCounter(mainWindow);
             }
 
             if (nameElement == null)
@@ -117,7 +153,7 @@ public class ConfigureParametersTest
 
             string actualName = (nameElement.Name ?? "").Trim();
             bool namePassed = string.Equals(actualName, expectedName, StringComparison.Ordinal);
-            _log((namePassed ? "PASS  | " : "FAIL  | ") + "Row " + excelRow + " | Expected='" + expectedName + "' | Actual='" + actualName + "'");
+            _log((namePassed ? "PASS  | " : "FAIL  | ") + "Row " + excelRow + " | Expected='" + expectedName + "' | Actual='" + actualName + "'" + where);
             if (namePassed)
             {
                 pass++;
@@ -242,7 +278,7 @@ public class ConfigureParametersTest
                 valuePassed = string.Equals(comparisonValue, expectedValue, StringComparison.Ordinal);
             }
 
-            _log((valuePassed ? "PASS  | " : "FAIL  | ") + "Row " + excelRow + " | Value Expected='" + expectedValue + "' | Actual='" + actualValue + "'");
+            _log((valuePassed ? "PASS  | " : "FAIL  | ") + "Row " + excelRow + " | Value Expected='" + expectedValue + "' | Actual='" + actualValue + "'" + where);
             if (valuePassed)
             {
                 pass++;
@@ -323,30 +359,59 @@ public class ConfigureParametersTest
     private static string? ExtractAutomationId(string? cell)
         => string.IsNullOrWhiteSpace(cell) ? null : cell.Trim();
 
+    private static string ReadBreadcrumb(FlaUI.Core.AutomationElements.Window window)
+    {
+        var crumb = window.FindFirstDescendant(cf => cf.ByAutomationId("BreadCrumb"));
+        return crumb == null ? "" : string.Join("", RawTexts(crumb, 0));
+    }
+
+    // "3 of 16 matches" - best effort (the counter is a Text without an id); "" when it cannot be found
+    private static string ReadCounter(FlaUI.Core.AutomationElements.Window window)
+    {
+        try
+        {
+            foreach (var t in window.FindAllDescendants(cf => cf.ByControlType(ControlType.Text)))
+            {
+                var m = Regex.Match(t.Name ?? "", @"^(\d+) of (\d+) matches");
+                if (m.Success)
+                {
+                    return "| result " + m.Groups[1].Value + " of " + m.Groups[2].Value;
+                }
+            }
+        }
+        catch
+        {
+            // best effort
+        }
+
+        return "";
+    }
+
     // Shows result N of the search for a channel parameter: presses "Next Result" until the breadcrumb says "Channel N Parameters".
-    private static AutomationElement? GoToChannel(FlaUI.Core.AutomationElements.Window window, string nameAutomationId, int channel)
+    // Returns the element only when the GUI itself says that channel is displayed; otherwise null (+ the last breadcrumb for the message).
+    private static (AutomationElement? element, string crumb, string counter) GoToChannel(FlaUI.Core.AutomationElements.Window window, string nameAutomationId, int channel)
     {
         string wanted = "Channel " + channel + " Parameters";
+        string text = "";
         for (int step = 0; step < 20; step++)
         {
-            var crumb = window.FindFirstDescendant(cf => cf.ByAutomationId("BreadCrumb"));
-            string text = crumb == null ? "" : string.Join("", RawTexts(crumb, 0));
+            text = ReadBreadcrumb(window);
             if (text.Contains(wanted, StringComparison.Ordinal))
             {
-                return FindWithRetry(window, nameAutomationId);
+                return (FindWithRetry(window, nameAutomationId), text, ReadCounter(window));
             }
 
             var next = window.FindFirstDescendant(cf => cf.ByHelpText("Next Result"));
             if (next == null || !next.IsEnabled)
             {
-                return null;
+                return (null, text, ReadCounter(window));
             }
 
             next.AsButton().Invoke();
             Thread.Sleep(900);
         }
 
-        return null;
+        return (null, text, ReadCounter(window));
     }
 
     private List<(string, string, string, string, string, int)> ReadTestData()

@@ -30,11 +30,10 @@ namespace PowerGUIAutomation.Tests;
 //      it is back to the default - the restore is attempted even if step 2 failed
 // At least MinChoicePerSample of the 10 are choice parameters (sampling quota).
 //
-// "Already tested" is stored per parameter row in the same workbook, in 4 columns added to the right of the
-// data: "Tested GUI Version", "Tested Date", "Tested Value/Option", "Control Type". A row counts as tested only
-// when its stored version equals the CURRENT GUI version (Product version incl. commit, read from the running
-// exe) - a new GUI build therefore makes every parameter untested again. If the workbook is open in Excel
-// (cannot be saved) the state goes to a JSON file next to the executable instead and is merged on the next run.
+// "Already tested" is stored in a SEPARATE workbook (PowerGUIAutomation\ConfigureRandomChange_Tested.xlsx, sheet "<PN> Tested").
+// A parameter counts as tested only when its stored GUI version equals the CURRENT one (Product version incl. commit,
+// read from the running exe) - a new GUI build makes every parameter untested again. It is marked ONLY after the
+// change was verified AND the restore to the Excel default was verified; only then is the next parameter drawn.
 //
 // Parameters that must never be changed (not changeable in this GUI): CAN Bus Baud Rate, Serial Baud Rate,
 // Destination Address, Unit ID Address.
@@ -64,7 +63,6 @@ public class ConfigureRandomChangeTest
         "CAN Bus Baud Rate", "Serial Baud Rate", "Destination Address", "Unit ID Address",
     };
 
-    private static readonly string[] StateHeaders = { "Tested GUI Version", "Tested Date", "Tested Value/Option", "Control Type" };
     private static readonly Regex BracketedRegex = new(@"^\[\s*([^,\]]+?)\s*[,\]]");
 
     private readonly string _excelPath;
@@ -126,7 +124,7 @@ public class ConfigureRandomChangeTest
     {
         public string Sheet = "", Name = "", NameId = "", ValueId = "", Default = "";
         public int ExcelRow, Channel;                 // Channel 0 = system parameter
-        public string Key => Sheet + ":" + ExcelRow;
+        public string Key => Sheet + "|" + Channel + "|" + Name;   // stable even if rows move in the master
         public string Label => (Channel > 0 ? "Channel " + Channel + " | " : "System | ") + Name + " (" + Sheet + " row " + ExcelRow + ")";
         public string KnownType = "";                 // "Edit" / "ComboBox" / "CheckBox" once seen
     }
@@ -223,7 +221,7 @@ public class ConfigureRandomChangeTest
         }
 
         all = all.Where(p => p.Channel <= _unit.Channels).ToList();      // a 12-channel unit has no channel 13..16
-        var candidates = all.Where(p => !NeverChange.Contains(p.Name)).ToList();
+        var candidates = all.Where(p => !NeverChange.Contains(p.Name) && !IsLogicParam(p.Name)).ToList();
         var untested = candidates.Where(p => !IsTestedNow(state, p)).ToList();
         int changedVersion = state.Values.Count(s => s.Version.Length > 0 && s.Version != _guiVersion);
         if (changedVersion > 0)
@@ -309,12 +307,7 @@ public class ConfigureRandomChangeTest
             if (outcome == Outcome.Failed)
             {
                 _log("STOPPED | halted after first failure - remaining parameters were not checked");
-                if (WaitSearchEnabled(search, 15000))
-                {
-                    search.Focus();
-                    search.Text = "";
-                }
-
+                ClearSearch(window);
                 LogResult(false, done, passed, _lastRestored);
                 return false;
             }
@@ -323,11 +316,7 @@ public class ConfigureRandomChangeTest
             untested.Remove(pick);
         }
 
-        if (WaitSearchEnabled(search, 15000))
-        {
-            search.Focus();
-            search.Text = "";
-        }
+        ClearSearch(window);
 
         _log("DONE  | checked=" + done + " passed=" + passed + " choice parameters=" + choiceDone + " | mode=" + (_dryRun ? "DRY RUN" : "REAL RUN"));
         LogResult(true, done, passed, true);
@@ -353,7 +342,7 @@ public class ConfigureRandomChangeTest
         isChoice = false;
         _lastRestored = true;
 
-        _log("STEP  | 1 locate the parameter (search box + result navigation)");
+        _log("STEP  | 1 draw a random parameter and find it (search box + result navigation)");
         var (nameEl, valueEl) = Locate(window, search, p);
         if (nameEl == null || valueEl == null)
         {
@@ -427,6 +416,7 @@ public class ConfigureRandomChangeTest
         }
 
         bool ok = true;
+        string? changedValueUsed = null;     // set once the change itself was verified; MARK happens only after the restore is verified too
         try
         {
             _log("STEP  | 4 set the new value in the GUI");
@@ -455,7 +445,7 @@ public class ConfigureRandomChangeTest
             if (ok)
             {
                 _log("STEP  | 6 verify the value after Save / Fetch");
-                var (_, v2) = Locate(window, search, p);
+                var (_, v2) = Locate(window, search, p, clearFirst: true);
                 string after = v2 == null ? "<NOT FOUND>" : ReadParam(window, p, out _);
                 bool changed = SameValue(after, newValue);
                 _log((changed ? "PASS  | " : "FAIL  | ") + p.Label + " | after Save/Fetch: expected='" + newValue + "' actual='" + after + "'");
@@ -466,10 +456,7 @@ public class ConfigureRandomChangeTest
                 }
 
                 ok &= changed;
-                if (changed)
-                {
-                    MarkTested(state, p, type, newValue);
-                }
+                changedValueUsed = changed ? newValue : null;
             }
         }
         catch (Exception ex)
@@ -493,6 +480,11 @@ public class ConfigureRandomChangeTest
         _log("STEP  | 7 restore the Excel default '" + p.Default + "' and verify it");
         bool restored = RestoreDefault(window, search, p);
         _lastRestored = restored;
+        if (ok && restored && changedValueUsed != null)
+        {
+            MarkTested(state, p, type, changedValueUsed);      // only now - change verified AND default restored+verified
+        }
+
         return ok && restored ? Outcome.Passed : Outcome.Failed;
     }
 
@@ -517,7 +509,7 @@ public class ConfigureRandomChangeTest
     {
         try
         {
-            var (_, v) = Locate(window, search, p);
+            var (_, v) = Locate(window, search, p, clearFirst: true);
             if (v == null)
             {
                 Fail(p, "7 restore default", "cannot restore the default: the parameter was not found again", "check the Configure screen manually");
@@ -545,7 +537,7 @@ public class ConfigureRandomChangeTest
                 return false;
             }
 
-            var (_, v2) = Locate(window, search, p);
+            var (_, v2) = Locate(window, search, p, clearFirst: true);
             string after = v2 == null ? "<NOT FOUND>" : ReadParam(window, p, out _);
             bool isDefault = SameValue(after, p.Default);
             _log((isDefault ? "PASS  | " : "FAIL  | ") + p.Label + " | back to default: expected='" + p.Default + "' actual='" + after + "'");
@@ -621,8 +613,24 @@ public class ConfigureRandomChangeTest
 
         if (!tip.Min.HasValue || !tip.Max.HasValue)
         {
-            why = "no Min/Max in the tooltip - cannot pick a value that is certainly in range";
-            return null;
+            // no range in the tooltip: take a value from the UNIT shown there (table below); a different value than the current one
+            if (!double.TryParse(cleaned, NumberStyles.Float, CultureInfo.InvariantCulture, out double curNum))
+            {
+                why = "no Min/Max in the tooltip and the current value '" + current + "' is not numeric";
+                return null;
+            }
+
+            double? byUnit = UnitTestValue(tip.TypeToken);
+            if (byUnit == null)
+            {
+                why = "no Min/Max in the tooltip and no test value is defined for the unit '" + tip.TypeToken + "' (see UnitTestValue)";
+                return null;
+            }
+
+            double chosen = Math.Abs(byUnit.Value - curNum) < 1e-9 ? byUnit.Value * 2 : byUnit.Value;     // already equal -> another value
+            int dec = cleaned.Contains('.') ? cleaned.Length - cleaned.IndexOf('.') - 1 : 0;
+            why = "no Min/Max in the tooltip - value chosen by its unit " + tip.TypeToken;
+            return chosen.ToString("F" + dec, CultureInfo.InvariantCulture);
         }
 
         double lo = tip.Min.Value, hi = tip.Max.Value;
@@ -658,6 +666,12 @@ public class ConfigureRandomChangeTest
         return value.ToString("F" + decimals, CultureInfo.InvariantCulture);
     }
 
+    // ------------------------------------------------------------------ logic parameters
+
+    // "Digital Output N Logic Control" and "Logic Expression" take free logic text with no Min/Max - this test does not change them
+    // (excluded from the draw, like the baud rates and addresses in NeverChange).
+    private static bool IsLogicParam(string name) => name.Contains("Logic Control", StringComparison.OrdinalIgnoreCase) || name.Equals("Logic Expression", StringComparison.OrdinalIgnoreCase);
+
     // ------------------------------------------------------------------ UI helpers
 
     private static readonly Regex MatchesRegex = new(@"^(\d+) of (\d+) matches", RegexOptions.Compiled);
@@ -678,6 +692,8 @@ public class ConfigureRandomChangeTest
         long lastLog = -100000;
         long? absentSince = null;
         bool announced = false;
+        string? lastProgress = null;
+        long progressSince = 0;
         while (sw.ElapsedMilliseconds < timeoutMs)
         {
             string? progress = null;
@@ -700,9 +716,9 @@ public class ConfigureRandomChangeTest
 
             if (progress == null)
             {
-                // the status text flickers while the GUI works - it must stay away for 3 s in a row
+                // the status text flickers while the GUI works - it must stay away for 1 s in a row
                 absentSince ??= sw.ElapsedMilliseconds;
-                if (sw.ElapsedMilliseconds - absentSince >= 3000)
+                if (sw.ElapsedMilliseconds - absentSince >= 1000)
                 {
                     if (announced)
                     {
@@ -718,6 +734,18 @@ public class ConfigureRandomChangeTest
 
             absentSince = null;
             announced = true;
+            if (progress != lastProgress)
+            {
+                lastProgress = progress;
+                progressSince = sw.ElapsedMilliseconds;
+            }
+            else if (sw.ElapsedMilliseconds - progressSince >= 8000 && FreshSearch(window) is { IsEnabled: true })
+            {
+                // same counter for 8 s while the search box is usable = stale status text, not a real load (a real load disables the search)
+                _log("WARN  | the status bar is stuck on 'Fetching parameters... " + progress + "' for 8 s but the search box is enabled - treating the load as finished (" + reason + ")");
+                return true;
+            }
+
             if (sw.ElapsedMilliseconds - lastLog > 20000)
             {
                 _log("INFO  | waiting - the GUI is still fetching parameters: " + progress + " (" + reason + ")");
@@ -769,7 +797,7 @@ public class ConfigureRandomChangeTest
                     return true;
                 }
             }
-            catch (Exception ex) when (ex is FlaUI.Core.Exceptions.ElementNotEnabledException or System.Runtime.InteropServices.COMException)
+            catch (Exception ex) when (ex is FlaUI.Core.Exceptions.ElementNotEnabledException or System.Runtime.InteropServices.COMException or InvalidOperationException)
             {
                 // disabled right now - wait and retry
             }
@@ -780,14 +808,54 @@ public class ConfigureRandomChangeTest
         return false;
     }
 
-    private (AutomationElement? name, AutomationElement? value) Locate(Window window, TextBox search, Param p)
+    // The search box element goes stale when the GUI re-creates the list (after Save/Fetch) - SetFocus then throws
+    // InvalidOperationException. So it is looked up again every time.
+    private static TextBox? FreshSearch(Window window) => window.FindFirstDescendant(cf => cf.ByAutomationId("searchTextBox"))?.AsTextBox();
+
+    // Press the search box's own X ("Clear Search") so the whole list is refreshed, as a user would; fall back to emptying the text.
+    private void ClearSearch(Window window)
     {
+        try
+        {
+            var x = FindByHelp(window, "Clear Search");
+            if (x != null && x.IsEnabled)
+            {
+                x.AsButton().Invoke();
+                Thread.Sleep(300);
+                return;
+            }
+
+            var sb = FreshSearch(window);
+            if (sb != null && WaitSearchEnabled(sb, 15000))
+            {
+                sb.Focus();
+                sb.Text = "";
+            }
+        }
+        catch (Exception ex)
+        {
+            _log("NOTE  | could not clear the search box: " + ex.Message);
+        }
+    }
+
+    private (AutomationElement? name, AutomationElement? value) Locate(Window window, TextBox search, Param p, bool clearFirst = false)
+    {
+        // restore step only: press X first so the list refreshes, then search the same parameter again (the plain search got stuck there)
+        if (clearFirst)
+        {
+            var swClear = Stopwatch.StartNew();
+            ClearSearch(window);
+            _log("INFO  | search cleared with X in " + swClear.ElapsedMilliseconds + " ms");
+        }
+
+        search = FreshSearch(window) ?? search;
         if (!WaitFetchDone(window, 300000, "before searching " + p.Name))
         {
             Fail(p, "1 locate the parameter", "the GUI kept 'Fetching parameters...' for more than 5 minutes", "is the unit connected and responding? (status bar shows BUS CONFLICT?)");
             return (null, null);
         }
 
+        search = FreshSearch(window) ?? search;
         if (!WaitSearchEnabled(search))
         {
             Fail(p, "1 locate the parameter", "the search box stayed disabled for 40 s - the Configure tab is still loading parameters (or the unit is not connected)", "wait until the Configure tab finished loading, check the unit connection");
@@ -1248,15 +1316,20 @@ public class ConfigureRandomChangeTest
         sw.Restart();
         while (sw.ElapsedMilliseconds < timeoutMs)
         {
-            Thread.Sleep(600);
+            Thread.Sleep(200);
             string now = ReadAppLog();
             if (now != before)
             {
-                Thread.Sleep(1500);
+                Thread.Sleep(300);
                 string added = Diff(before, ReadAppLog());
                 if (added.Length > 0)
                 {
                     _log("APPLOG| " + added.Replace("\r", "").Replace("\n", " ## "));
+                    if (Regex.IsMatch(added, @"Failed|Error|Timeout", RegexOptions.IgnoreCase))
+                    {
+                        // known GUI bug: "Failed to save..." appears although the value is stored - NOT a failure here, the read-back after Fetch decides
+                        _log("NOTE  | " + p.Label + " | the GUI log reports a problem after '" + label + "' (ignored, the read-back after Fetch decides)");
+                    }
                 }
 
                 if (HasPasswordDialog(window))
@@ -1326,6 +1399,17 @@ public class ConfigureRandomChangeTest
         }
 
         return string.Equals(a, b, StringComparison.OrdinalIgnoreCase);
+    }
+
+    // Test value per unit for parameters whose tooltip has no Min/Max. EDIT HERE to add units; unknown units are skipped.
+    private static double? UnitTestValue(string unitToken)
+    {
+        switch (unitToken.Trim().Trim('[', ']').ToLowerInvariant())
+        {
+            case "msec": case "ms": return 10;
+            case "sec": case "s": return 1;
+            default: return null;
+        }
     }
 
     private static bool TryNum(string s, out double d) => double.TryParse(s, NumberStyles.Float, CultureInfo.InvariantCulture, out d);
@@ -1405,42 +1489,33 @@ public class ConfigureRandomChangeTest
         return temp;
     }
 
-    private string JsonPath => Path.Combine(AppContext.BaseDirectory, "ConfigureRandomChange_State.json");
+    // Tested-state lives in its OWN workbook next to the project (never in the master): one sheet "<PN> Tested", one row per
+    // parameter that was ever tested. A parameter is drawn only if it is not listed for the CURRENT GUI version.
+    private string StatePath => Path.Combine(Path.GetDirectoryName(_excelPath)!, "PowerGUIAutomation", "ConfigureRandomChange_Tested.xlsx");
+    private string StateSheet => _unit.PartNumber + " Tested";
+    private static readonly string[] StateCols = { "Key", "Channel", "Parameter Name", "Control Type", "Tested GUI Version", "Tested Date", "Tried Values/Options" };
 
     private Dictionary<string, State> LoadState(List<Param> all)
     {
         var state = new Dictionary<string, State>();
-        string temp = CopyToTemp();
+        if (!File.Exists(StatePath))
+        {
+            return state;
+        }
+
+        string temp = Path.Combine(Path.GetTempPath(), "ConfigRandomState_" + Guid.NewGuid().ToString("N") + ".xlsx");
+        File.Copy(StatePath, temp, true);
         try
         {
             using var wb = new XLWorkbook(temp);
-            foreach (var name in Sheets)
+            if (wb.Worksheets.Contains(StateSheet))
             {
-                if (!wb.Worksheets.Contains(name))
+                foreach (var row in wb.Worksheet(StateSheet).RowsUsed().Skip(1))
                 {
-                    continue;
-                }
-
-                var ws = wb.Worksheet(name);
-                var cols = StateColumns(ws, create: false);
-                if (cols == null)
-                {
-                    continue;
-                }
-
-                foreach (var p in all.Where(x => x.Sheet == name))
-                {
-                    var row = ws.Row(p.ExcelRow);
-                    string version = row.Cell(cols[0]).GetString().Trim();
-                    string type = row.Cell(cols[3]).GetString().Trim();
-                    if (type.Length > 0)
+                    string key = row.Cell(1).GetString().Trim();
+                    if (key.Length > 0)
                     {
-                        p.KnownType = type;
-                    }
-
-                    if (version.Length > 0 || type.Length > 0)
-                    {
-                        state[p.Key] = new State { Version = version, Date = row.Cell(cols[1]).GetString().Trim(), Tried = row.Cell(cols[2]).GetString().Trim(), Type = type };
+                        state[key] = new State { Type = row.Cell(4).GetString().Trim(), Version = row.Cell(5).GetString().Trim(), Date = row.Cell(6).GetString().Trim(), Tried = row.Cell(7).GetString().Trim() };
                     }
                 }
             }
@@ -1448,25 +1523,6 @@ public class ConfigureRandomChangeTest
         finally
         {
             try { File.Delete(temp); } catch { /* temp copy */ }
-        }
-
-        if (File.Exists(JsonPath))
-        {
-            try
-            {
-                var fromJson = JsonSerializer.Deserialize<Dictionary<string, State>>(File.ReadAllText(JsonPath)) ?? new();
-                foreach (var kv in fromJson)
-                {
-                    if (!state.TryGetValue(kv.Key, out var existing) || string.CompareOrdinal(kv.Value.Date, existing.Date) > 0)
-                    {
-                        state[kv.Key] = kv.Value;
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                _log("WARN  | could not read " + JsonPath + ": " + ex.Message);
-            }
         }
 
         foreach (var p in all.Where(x => state.TryGetValue(x.Key, out var s) && s.Type.Length > 0))
@@ -1503,60 +1559,50 @@ public class ConfigureRandomChangeTest
         _log("MARK  | " + p.Label + " | tested on GUI version " + _guiVersion);
     }
 
-    private static int[]? StateColumns(IXLWorksheet ws, bool create)
-    {
-        var header = ws.Row(1);
-        var cols = new int[StateHeaders.Length];
-        int last = header.CellsUsed().Max(c => c.Address.ColumnNumber);
-        for (int i = 0; i < StateHeaders.Length; i++)
-        {
-            var found = header.CellsUsed().FirstOrDefault(c => c.GetString().Trim() == StateHeaders[i]);
-            if (found != null)
-            {
-                cols[i] = found.Address.ColumnNumber;
-            }
-            else if (create)
-            {
-                cols[i] = ++last;
-                ws.Cell(1, cols[i]).Value = StateHeaders[i];
-                ws.Cell(1, cols[i]).Style.Font.Bold = true;
-            }
-            else
-            {
-                return null;
-            }
-        }
-
-        return cols;
-    }
-
-    // Persist after every parameter, so an aborted run keeps its results.
+    // Persist after every parameter, so an aborted run keeps its results. Whole sheet is rewritten from memory.
     private void SaveState(Dictionary<string, State> state, Param justChanged)
     {
-        try
+        for (int attempt = 1; attempt <= 3; attempt++)
         {
-            using var wb = new XLWorkbook(_excelPath);   // throws IOException if Excel has it open
-            foreach (var group in state.Where(kv => kv.Key.StartsWith(justChanged.Sheet + ":")))
+            try
             {
-                var ws = wb.Worksheet(justChanged.Sheet);
-                var cols = StateColumns(ws, create: true)!;
-                int row = int.Parse(group.Key[(justChanged.Sheet.Length + 1)..]);
-                ws.Cell(row, cols[0]).Value = group.Value.Version;
-                ws.Cell(row, cols[1]).Value = group.Value.Date;
-                ws.Cell(row, cols[2]).Value = group.Value.Tried;
-                ws.Cell(row, cols[3]).Value = group.Value.Type;
-            }
+                using var wb = File.Exists(StatePath) ? new XLWorkbook(StatePath) : new XLWorkbook();   // IOException if Excel has it open
+                var ws = wb.Worksheets.Contains(StateSheet) ? wb.Worksheet(StateSheet) : wb.AddWorksheet(StateSheet);
+                ws.Clear();
+                for (int c = 0; c < StateCols.Length; c++)
+                {
+                    ws.Cell(1, c + 1).Value = StateCols[c];
+                    ws.Cell(1, c + 1).Style.Font.Bold = true;
+                }
 
-            wb.Save();
-            if (File.Exists(JsonPath))
-            {
-                File.Delete(JsonPath);
+                int r = 2;
+                foreach (var kv in state.Where(k => k.Key.StartsWith(_unit.ParameterSheet + "|")).OrderBy(k => k.Key, StringComparer.Ordinal))
+                {
+                    var parts = kv.Key.Split('|');
+                    ws.Cell(r, 1).Value = kv.Key;
+                    ws.Cell(r, 2).Value = parts.Length > 1 ? parts[1] : "";
+                    ws.Cell(r, 3).Value = parts.Length > 2 ? parts[2] : "";
+                    ws.Cell(r, 4).Value = kv.Value.Type;
+                    ws.Cell(r, 5).Value = kv.Value.Version;
+                    ws.Cell(r, 6).Value = kv.Value.Date;
+                    ws.Cell(r, 7).Value = kv.Value.Tried;
+                    r++;
+                }
+
+                ws.Columns().AdjustToContents();
+                wb.SaveAs(StatePath);
+                return;
             }
-        }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-        {
-            File.WriteAllText(JsonPath, JsonSerializer.Serialize(state));
-            _log("WARN  | workbook is open/locked - tested-state saved to " + JsonPath + " instead (close Excel to store it in the workbook)");
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                if (attempt == 3)
+                {
+                    _log("WARN  | tested-state file is open/locked (" + StatePath + ") - NOT saved; close it in Excel. This result will be lost if the run stops.");
+                    return;
+                }
+
+                Thread.Sleep(1500);
+            }
         }
     }
 }

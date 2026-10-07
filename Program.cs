@@ -102,6 +102,86 @@ void PrintColored(string stamped, string line)
 
 Log("SESSION START | PowerGUIAutomation launched");
 
+// Boxed header printed when a test is chosen (console, cyan) and written as plain lines to the log file, so the start of every
+// test is easy to find when searching the logs afterwards.
+void ShowTestBanner(string? choice, UnitProfile? bannerUnit)
+{
+    string? title = choice?.Trim() switch
+    {
+        "1" => "OPERATE - SECOND BAR (UNIT INFO BAR) COMPARISON",
+        "2" => "CONFIGURE - PARAMETERS COMPARISON",
+        "3" => "CONFIGURE - RANDOM PARAMETER CHANGE TEST",
+        "4" => "CONFIGURE - AUTOMATIONID SCAN (READ-ONLY)",
+        "5" => "DEBUG - CONFIGURE COMPARISON ON CHOSEN CHANNELS / PARAMETERS",
+        _ => null,
+    };
+    if (title == null)
+    {
+        return;
+    }
+
+    string unitText = "Unit: " + (bannerUnit?.Name ?? "(none selected)") + "   |   " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
+    int width = Math.Max(Math.Max(title.Length, unitText.Length) + 6, 64);
+    string Line(string t) => "║  " + t.PadRight(width - 4) + "║";
+    string[] box =
+    {
+        "╔" + new string('═', width - 2) + "╗",
+        Line("TEST RUNNER: " + title),
+        Line(unitText),
+        "╚" + new string('═', width - 2) + "╝",
+    };
+
+    Console.OutputEncoding = System.Text.Encoding.UTF8;
+    Console.WriteLine();
+    foreach (var l in box)
+    {
+        Write(l, ConsoleColor.Cyan);
+    }
+
+    Console.WriteLine();
+    File.AppendAllText(logPath, Environment.NewLine + "=================== TEST SELECTED: " + title + " | " + unitText + " ===================" + Environment.NewLine);
+}
+
+// The master workbook must exist at ExcelPath and be CLOSED in Excel while a test runs (an open workbook is locked / may be saved over).
+bool MasterOk()
+{
+    if (!File.Exists(ExcelPath))
+    {
+        Log("FAIL | the master workbook was not found at: " + ExcelPath + " - fix ExcelPath in Program.cs (or move the file back)");
+        return false;
+    }
+
+    try
+    {
+        using var fs = new FileStream(ExcelPath, FileMode.Open, FileAccess.ReadWrite, FileShare.None);   // fails while Excel has it open
+        return true;
+    }
+    catch (IOException)
+    {
+        Log("FAIL | the master workbook is OPEN (in Excel?) - close it and run again: " + ExcelPath);
+        return false;
+    }
+}
+
+// Configure tests assume every parameter starts at its Excel default, so the unit must be reset to default BEFORE the run.
+bool UnitResetConfirmed(bool interactive)
+{
+    if (!interactive)
+    {
+        Log("WARN | scripted run - make sure the unit was reset to default before this test (not asked)");
+        return true;
+    }
+
+    Console.Write("Was the unit RESET TO DEFAULT before this test? (Y/N): ");
+    if (string.Equals(Console.ReadLine()?.Trim(), "Y", StringComparison.OrdinalIgnoreCase))
+    {
+        return true;
+    }
+
+    Log("ABORT | reset the unit to default first, then run the test again");
+    return false;
+}
+
 // The unit under test (chosen by PART NUMBER) decides which Excel sheets the tests read (see UnitProfile.cs), how many
 // channels to expect and which unit must be connected. There is no default: the user must pick one.
 // Scripted runs pass it as an argument, e.g. "PowerGUIAutomation.exe unit=RD152 3".
@@ -187,6 +267,8 @@ while (true)
         Console.WriteLine("1. Operate - Second Bar (unit info bar) comparison");
         Console.WriteLine("2. Configure - Parameters comparison");
         Console.WriteLine("3. Configure - Random parameter change test ");
+        Console.WriteLine("4. Configure - AutomationId scan of all parameters (read-only, report to Excel)");
+        Console.WriteLine("5. Debug - Configure comparison on chosen channels / parameters only (read-only)");
         Console.WriteLine("U. Change the unit under test");
         Console.WriteLine("0. Exit");
         Console.Write("Choice: ");
@@ -206,12 +288,14 @@ while (true)
     }
 
     Log("MENU | choice selected: " + choice);
+    ShowTestBanner(choice, unit);
 
     switch (choice)
     {
         case "1":
             try
             {
+                if (!MasterOk()) { break; }
                 var test = new OperateSecondBarTest(ExcelPath, Log);
                 bool passed = test.Run();
                 Log(passed ? "=== TEST PASSED ===" : "=== TEST FAILED ===");
@@ -225,6 +309,7 @@ while (true)
             try
             {
                 if (unit == null) { Log("FAIL | no unit selected - choose the unit (part number) first: press U, or pass unit=RD152"); break; }
+                if (!MasterOk() || !UnitResetConfirmed(!nonInteractive)) { break; }
                 var configureTest = new ConfigureParametersTest(ExcelPath, Log, new[] { unit.ParameterSheet }, unit);
                 bool configurePassed = configureTest.Run();
                 Log(configurePassed ? "=== TEST PASSED ===" : "=== TEST FAILED ===");
@@ -238,9 +323,38 @@ while (true)
             try
             {
                 if (unit == null) { Log("FAIL | no unit selected - choose the unit (part number) first: press U, or pass unit=RD152"); break; }
+                if (!MasterOk() || !UnitResetConfirmed(!nonInteractive)) { break; }
                 var randomChangeTest = new ConfigureRandomChangeTest(ExcelPath, Log, unit);
                 bool randomChangePassed = randomChangeTest.Run();
                 Log(randomChangePassed ? "=== TEST PASSED ===" : "=== TEST FAILED ===");
+            }
+            catch (Exception ex)
+            {
+                Log("FAIL | Unhandled error (" + ex.GetType().Name + "): " + ex.Message + " | at " + ex.StackTrace?.Split(Environment.NewLine).FirstOrDefault()?.Trim());
+            }
+            break;
+        case "4":
+            try
+            {
+                if (unit == null) { Log("FAIL | no unit selected - choose the unit (part number) first: press U, or pass unit=RD152"); break; }
+                if (!MasterOk()) { break; }
+                var scanTest = new ConfigureIdScanTest(ExcelPath, Log, unit);
+                bool scanPassed = scanTest.Run();
+                Log(scanPassed ? "=== TEST PASSED ===" : "=== TEST FAILED ===");
+            }
+            catch (Exception ex)
+            {
+                Log("FAIL | Unhandled error (" + ex.GetType().Name + "): " + ex.Message + " | at " + ex.StackTrace?.Split(Environment.NewLine).FirstOrDefault()?.Trim());
+            }
+            break;
+        case "5":
+            try
+            {
+                if (unit == null) { Log("FAIL | no unit selected - choose the unit (part number) first: press U, or pass unit=RD152"); break; }
+                if (!MasterOk()) { break; }
+                var debugTest = new ConfigureDebugTest(ExcelPath, Log, unit);
+                bool debugPassed = debugTest.Run();
+                Log(debugPassed ? "=== TEST PASSED ===" : "=== TEST FAILED ===");
             }
             catch (Exception ex)
             {
