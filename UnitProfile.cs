@@ -8,10 +8,9 @@ namespace PowerGUIAutomation;
 // The GUI shows the part number zero-padded ("85 RD000152"), the list below uses the short form (RD152); both are
 // compared by their number.
 //
-// Excel sheets: the RD152 data keeps the original sheet names. Every other unit uses "<PartNumber> System Parameters" and
-// "<PartNumber> Channel Parameters" - create those two sheets in the master workbook (same columns as the RD152 sheets)
-// when the unit's parameter list is ready. A unit without its sheets can be selected, but the Configure tests stop with
-// a clear message.
+// Excel sheet: every unit has ONE sheet named "<PartNumber> Parameters" (RD152 -> "RD152 Parameters") that holds its system
+// AND channel parameters: Channel (System / 1..16) | Name Automation ID | Parameter Name | Value Automation ID | Value (default).
+// A unit without its sheet can be selected, but the Configure tests stop with a clear message.
 //
 // To add a unit: add one line to All.
 public sealed class UnitProfile
@@ -19,19 +18,17 @@ public sealed class UnitProfile
     public string PartNumber { get; }          // short form, e.g. "RD152"
     public int Channels { get; }
     public string Note { get; }                // free text shown in the menu, e.g. "Negative"
-    public string SystemSheet { get; }
-    public string ChannelSheet { get; }
+    public string ParameterSheet { get; }      // one sheet holds the unit's system AND channel parameters
     public int PartNumberValue { get; }        // 152
 
     public string Name => PartNumber + " - " + Channels + " CH" + (Note.Length > 0 ? " (" + Note + ")" : "");
 
-    public UnitProfile(string partNumber, int channels, string note = "", string? systemSheet = null, string? channelSheet = null)
+    public UnitProfile(string partNumber, int channels, string note = "", string? parameterSheet = null)
     {
         PartNumber = partNumber;
         Channels = channels;
         Note = note;
-        SystemSheet = systemSheet ?? partNumber + " System Parameters";
-        ChannelSheet = channelSheet ?? partNumber + " Channel Parameters";
+        ParameterSheet = parameterSheet ?? partNumber + " Parameters";
         PartNumberValue = ParsePartNumber(partNumber) ?? throw new ArgumentException("bad part number " + partNumber);
     }
 
@@ -49,7 +46,7 @@ public sealed class UnitProfile
 
     public static readonly IReadOnlyList<UnitProfile> All = new List<UnitProfile>
     {
-        new("RD152", 16, systemSheet: "System Parameters", channelSheet: "Channel Parameters"),   // the data that exists today
+        new("RD152", 16),                 // sheet "RD152 Parameters"
         new("RD323", 16),
         new("RD320", 16),
         new("RD249", 16),

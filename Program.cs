@@ -117,7 +117,7 @@ bool SelectUnit(string text)
     }
 
     unit = match;
-    Log("MENU | unit under test: " + unit.Name + " (sheets '" + unit.SystemSheet + "' / '" + unit.ChannelSheet + "')");
+    Log("MENU | unit under test: " + unit.Name + " (sheet '" + unit.ParameterSheet + "')");
     return true;
 }
 
@@ -186,7 +186,7 @@ while (true)
         Console.WriteLine("=== Power GUI Automation === | Unit: " + (unit?.Name ?? "(none selected)"));
         Console.WriteLine("1. Operate - Second Bar (unit info bar) comparison");
         Console.WriteLine("2. Configure - Parameters comparison");
-        Console.WriteLine("3. Configure - Random parameter change test (change, save, reset, fetch, verify, restore default)");
+        Console.WriteLine("3. Configure - Random parameter change test ");
         Console.WriteLine("U. Change the unit under test");
         Console.WriteLine("0. Exit");
         Console.Write("Choice: ");
@@ -225,7 +225,7 @@ while (true)
             try
             {
                 if (unit == null) { Log("FAIL | no unit selected - choose the unit (part number) first: press U, or pass unit=RD152"); break; }
-                var configureTest = new ConfigureParametersTest(ExcelPath, Log, new[] { unit.SystemSheet, unit.ChannelSheet }, unit);
+                var configureTest = new ConfigureParametersTest(ExcelPath, Log, new[] { unit.ParameterSheet }, unit);
                 bool configurePassed = configureTest.Run();
                 Log(configurePassed ? "=== TEST PASSED ===" : "=== TEST FAILED ===");
             }

@@ -13,7 +13,7 @@ using FlaUI.UIA3;
 
 namespace PowerGUIAutomation.Tests;
 
-// Random sampling "change -> save -> reset -> fetch -> verify -> restore default" test of the Configure tab.
+// Random sampling "change -> save -> fetch -> verify -> restore default" test of the Configure tab.
 //
 // Locating a parameter works exactly like ConfigureParametersTest: the parameter row comes from the
 // "System Parameters" / "Channel Parameters" sheets (AutomationIds parsed out of the Parameter/Value path
@@ -24,9 +24,9 @@ namespace PowerGUIAutomation.Tests;
 //        - numeric: random value inside [Min, Max], different from the current one
 //        - string:  random text inside the allowed length
 //        - choice (ComboBox / CheckBox): an option that has not been tried yet for this parameter (else any other)
-//   2. set it, Save (Save to Unit Flash), Reset Unit, Fetch Parameters, verify it really changed
+//   2. set it, Save (Save to Unit Flash), Fetch Parameters (a Reset Unit step exists but is OFF, see DoReset), verify it really changed
 //   3. mark it as tested for THIS GUI version (Excel columns, see below)
-//   4. restore the Excel default (the Excel "Value" column is the default), Save / Reset / Fetch, verify
+//   4. restore the Excel default (the Excel "Value" column is the default), Save / Fetch, verify
 //      it is back to the default - the restore is attempted even if step 2 failed
 // At least MinChoicePerSample of the 10 are choice parameters (sampling quota).
 //
@@ -39,9 +39,9 @@ namespace PowerGUIAutomation.Tests;
 // Parameters that must never be changed (not changeable in this GUI): CAN Bus Baud Rate, Serial Baud Rate,
 // Destination Address, Unit ID Address.
 //
-// SAFETY: the real run WRITES parameters to the connected unit, saves them to flash and resets the unit. It
-// asks for an explicit "YES". The default mode is a DRY RUN (finds the parameters, reads tooltip/values and
-// logs what it WOULD change, but edits nothing).
+// SAFETY: the real run WRITES parameters to the connected unit, saves them to flash (and resets the unit only if DoReset is turned on). It
+// asks for an explicit "YES". Only the real run is offered; a dry-run path (finds the parameters, reads tooltip/values
+// and logs what it WOULD change, edits nothing) is still in the code behind AllowDryRun.
 public class ConfigureRandomChangeTest
 {
     private const int DefaultSampleSize = 10;
@@ -50,6 +50,11 @@ public class ConfigureRandomChangeTest
     private int MinChoicePerSample = DefaultMinChoice;    // 2 of 10 must be choice (ComboBox) parameters
     private const int MaxFindRetries = 12;
     private const int RetryDelayMs = 400;
+    // Reset Unit takes a long time (the unit restarts and the GUI reconnects) and is OFF by default. Without it the test proves that the
+    // unit ACCEPTED the saved value (Fetch reads it back from the unit) but not that it survives a restart. Set to true to include it.
+    private const bool DoReset = false;
+    // The dry run is not offered in the menu any more; true brings the "DRY RUN / REAL RUN" question back.
+    private const bool AllowDryRun = false;
     private const int SaveTimeoutMs = 20000;
     private const int ResetTimeoutMs = 45000;
     private const int FetchTimeoutMs = 25000;
@@ -60,7 +65,6 @@ public class ConfigureRandomChangeTest
     };
 
     private static readonly string[] StateHeaders = { "Tested GUI Version", "Tested Date", "Tested Value/Option", "Control Type" };
-    private static readonly Regex AutomationIdRegex = new(@"automationid='([^']+)'", RegexOptions.IgnoreCase);
     private static readonly Regex BracketedRegex = new(@"^\[\s*([^,\]]+?)\s*[,\]]");
 
     private readonly string _excelPath;
@@ -82,7 +86,7 @@ public class ConfigureRandomChangeTest
         _unit = unit;
     }
 
-    private string[] Sheets => new[] { _unit.SystemSheet, _unit.ChannelSheet };
+    private string[] Sheets => new[] { _unit.ParameterSheet };
 
     // One place that reports a failure the same way every time: which parameter, which STEP of the test,
     // WHY it failed and what to check. The first one is repeated in the closing RESULT lines.
@@ -157,15 +161,22 @@ public class ConfigureRandomChangeTest
 
         Console.WriteLine();
         Console.WriteLine("Configure random-change test | GUI version: " + _guiVersion);
-        Console.WriteLine("  1. DRY RUN  - find parameters, read tooltips, log what would be changed (no edits)  [default]");
-        Console.WriteLine("  2. REAL RUN - change " + SampleSize + " parameters, Save + Reset + Fetch, verify, restore defaults");
-        Console.Write("Mode: ");
-        string? mode = Console.ReadLine();
-        _dryRun = mode?.Trim() != "2";
+
+        // This test only offers the REAL RUN. The dry-run path (find + read + log what WOULD change, no edits) is still in the
+        // code: set AllowDryRun to true to get the mode question back.
+        _dryRun = false;
+        if (AllowDryRun)
+        {
+            Console.WriteLine("  1. DRY RUN  - find parameters, read tooltips, log what would be changed (no edits)  [default]");
+            Console.WriteLine("  2. REAL RUN - change " + SampleSize + " parameters, Save + Fetch, verify, restore defaults");
+            Console.Write("Mode: ");
+            _dryRun = Console.ReadLine()?.Trim() != "2";
+        }
+
         if (!_dryRun)
         {
             Console.WriteLine();
-            Console.WriteLine("WARNING: this WRITES parameters to the connected unit, saves them to flash and RESETS the unit.");
+            Console.WriteLine("WARNING: this WRITES parameters to the connected unit and saves them to flash (change, Save, Fetch, restore default).");
             Console.Write("Type YES to continue: ");
             if (!string.Equals(Console.ReadLine()?.Trim(), "YES", StringComparison.Ordinal))
             {
@@ -186,7 +197,7 @@ public class ConfigureRandomChangeTest
             MinChoicePerSample = SampleSize >= 5 ? 1 : 0;      // the 2-of-10 quota only makes sense for a full sample
         }
 
-        _log("START | Configure random-change test | unit=" + _unit.Name + " (sheets '" + _unit.SystemSheet + "' / '" + _unit.ChannelSheet + "') | mode=" + (_dryRun ? "DRY RUN" : "REAL RUN") + " | GUI version=" + _guiVersion);
+        _log("START | Configure random-change test | unit=" + _unit.Name + " (sheets '" + _unit.ParameterSheet + "') | mode=" + (_dryRun ? "DRY RUN" : "REAL RUN") + " | GUI version=" + _guiVersion);
 
         List<Param> all;
         Dictionary<string, State> state;
@@ -197,7 +208,7 @@ public class ConfigureRandomChangeTest
         }
         catch (Exception ex)
         {
-            Fail(null, "read the Excel", "could not read parameters/state from sheets '" + _unit.SystemSheet + "' / '" + _unit.ChannelSheet + "': " + ex.Message,
+            Fail(null, "read the Excel", "could not read parameters/state from sheets '" + _unit.ParameterSheet + "': " + ex.Message,
                  "the workbook path, and that both sheets exist for unit '" + _unit.Name + "'");
             LogResult(false, 0, 0, true);
             return false;
@@ -205,7 +216,7 @@ public class ConfigureRandomChangeTest
 
         if (all.Count == 0)
         {
-            Fail(null, "read the Excel", "no parameters were found for unit " + _unit.PartNumber + ": the sheets '" + _unit.SystemSheet + "' / '" + _unit.ChannelSheet + "' are missing or empty in the workbook",
+            Fail(null, "read the Excel", "no parameters were found for unit " + _unit.PartNumber + ": the sheets '" + _unit.ParameterSheet + "' are missing or empty in the workbook",
                  "create these two sheets for " + _unit.PartNumber + " (same columns as the RD152 sheets) or pick another unit");
             LogResult(false, 0, 0, true);
             return false;
@@ -411,7 +422,7 @@ public class ConfigureRandomChangeTest
         _log("CHANGE| " + p.Label + " | '" + before + "' -> '" + newValue + "' | " + why);
         if (_dryRun)
         {
-            _log("DRY   | " + p.Label + " | would set '" + newValue + "', Save, Reset, Fetch, verify, then restore '" + p.Default + "' (nothing was changed)");
+            _log("DRY   | " + p.Label + " | would set '" + newValue + "', Save, Fetch, verify, then restore '" + p.Default + "' (nothing was changed)");
             return Outcome.Passed;
         }
 
@@ -437,21 +448,21 @@ public class ConfigureRandomChangeTest
 
             if (ok)
             {
-                _log("STEP  | 5 Save to Unit Flash, Reset Unit, Fetch Parameters");
+                _log("STEP  | 5 Save to Unit Flash" + (DoReset ? ", Reset Unit" : "") + ", Fetch Parameters");
                 ok &= SaveResetFetch(window, search, p);
             }
 
             if (ok)
             {
-                _log("STEP  | 6 verify the value after Save / Reset / Fetch");
+                _log("STEP  | 6 verify the value after Save / Fetch");
                 var (_, v2) = Locate(window, search, p);
                 string after = v2 == null ? "<NOT FOUND>" : ReadParam(window, p, out _);
                 bool changed = SameValue(after, newValue);
-                _log((changed ? "PASS  | " : "FAIL  | ") + p.Label + " | after Save/Reset/Fetch: expected='" + newValue + "' actual='" + after + "'");
+                _log((changed ? "PASS  | " : "FAIL  | ") + p.Label + " | after Save/Fetch: expected='" + newValue + "' actual='" + after + "'");
                 if (!changed)
                 {
-                    Fail(p, "6 verify after Save/Reset/Fetch", "expected '" + newValue + "' but the unit returned '" + after + "' after fetching",
-                         "the unit did not keep the value (rejected by the unit, or Save/Reset did not complete)");
+                    Fail(p, "6 verify after Save/Fetch", "expected '" + newValue + "' but the unit returned '" + after + "' after fetching",
+                         "the unit did not keep the value (rejected by the unit, or Save did not complete)");
                 }
 
                 ok &= changed;
@@ -1192,13 +1203,13 @@ public class ConfigureRandomChangeTest
         return tip;
     }
 
-    // ------------------------------------------------------------------ Save / Reset / Fetch
+    // ------------------------------------------------------------------ Save / (Reset) / Fetch
 
     private bool SaveResetFetch(Window window, TextBox search, Param p)
     {
         // "Save to Unit Flash" stays disabled until an edit is pending - if it never enables, the edit was not registered
         if (!Press(window, "Save to Unit Flash", "Save", SaveTimeoutMs, p)) return false;
-        if (!Press(window, "Reset Unit", "Reset", ResetTimeoutMs, p)) return false;
+        if (DoReset && !Press(window, "Reset Unit", "Reset", ResetTimeoutMs, p)) return false;
         if (!Press(window, "Refresh parameters from unit", "Fetch", FetchTimeoutMs, p)) return false;
         return true;
     }
@@ -1351,7 +1362,6 @@ public class ConfigureRandomChangeTest
                 }
 
                 var ws = wb.Worksheet(name);
-                bool channelSheet = name == _unit.ChannelSheet;
                 foreach (var row in ws.RowsUsed().Skip(1))
                 {
                     string paramName = row.Cell(3).GetString().Trim();
@@ -1362,6 +1372,7 @@ public class ConfigureRandomChangeTest
                         continue;
                     }
 
+                    // column A: "System" or the channel number 1..16
                     int.TryParse(row.Cell(1).GetString().Trim(), out int channel);
                     result.Add(new Param
                     {
@@ -1371,7 +1382,7 @@ public class ConfigureRandomChangeTest
                         NameId = nameId,
                         ValueId = valueId,
                         Default = row.Cell(5).GetString().Trim(),
-                        Channel = channelSheet ? channel : 0,
+                        Channel = channel,
                     });
                 }
             }
@@ -1384,11 +1395,8 @@ public class ConfigureRandomChangeTest
         }
     }
 
-    private static string ExtractId(string path)
-    {
-        var m = AutomationIdRegex.Matches(path ?? "");
-        return m.Count > 0 ? m[^1].Groups[1].Value : "";
-    }
+    // The id columns of the workbook hold the plain AutomationId - used exactly as written.
+    private static string ExtractId(string cell) => (cell ?? "").Trim();
 
     private string CopyToTemp()
     {

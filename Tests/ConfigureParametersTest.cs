@@ -24,7 +24,6 @@ public class ConfigureParametersTest
     private readonly Action<string> _log;
     private readonly string[] _sheetNames;
     private readonly UnitProfile? _unit;
-    private static readonly Regex AutomationIdRegex = new(@"automationid='([^']+)'", RegexOptions.IgnoreCase);
     private static readonly Regex BracketedRegex = new(@"^\[\s*([^,\]]+?)\s*[,\]]");
 
     public ConfigureParametersTest(string excelPath, Action<string> log, string[]? sheetNames = null, UnitProfile? unit = null)
@@ -61,7 +60,7 @@ public class ConfigureParametersTest
 
         var searchBox = searchBoxElement.AsTextBox();
 
-        List<(string excelRow, string parameterPath, string expectedName, string valuePath, string expectedValue)> dataRows;
+        List<(string excelRow, string parameterPath, string expectedName, string valuePath, string expectedValue, int channel)> dataRows;
         try
         {
             dataRows = ReadTestData();
@@ -74,7 +73,7 @@ public class ConfigureParametersTest
 
         int pass = 0, fail = 0, skip = 0;
 
-        foreach (var (excelRow, parameterPath, expectedName, valuePath, expectedValue) in dataRows)
+        foreach (var (excelRow, parameterPath, expectedName, valuePath, expectedValue, channel) in dataRows)
         {
             if (string.IsNullOrWhiteSpace(parameterPath))
             {
@@ -103,6 +102,12 @@ public class ConfigureParametersTest
             Keyboard.TypeSimultaneously(VirtualKeyShort.CONTROL, VirtualKeyShort.KEY_V);
 
             var nameElement = FindWithRetry(mainWindow, nameAutomationId);
+            if (nameElement != null && channel > 0)
+            {
+                // the search shows ONE result at a time (1 of 16 matches): step to the wanted channel
+                nameElement = GoToChannel(mainWindow, nameAutomationId, channel) ?? nameElement;
+            }
+
             if (nameElement == null)
             {
                 _log("FAIL  | Row " + excelRow + " | Expected='" + expectedName + "' | name element not found after " + MaxFindRetries + " attempts (automationid=" + nameAutomationId + ")");
@@ -314,17 +319,40 @@ public class ConfigureParametersTest
         return null;
     }
 
-    private static string? ExtractAutomationId(string? rxPath)
+    // The id columns of the workbook hold the plain AutomationId - used exactly as written.
+    private static string? ExtractAutomationId(string? cell)
+        => string.IsNullOrWhiteSpace(cell) ? null : cell.Trim();
+
+    // Shows result N of the search for a channel parameter: presses "Next Result" until the breadcrumb says "Channel N Parameters".
+    private static AutomationElement? GoToChannel(FlaUI.Core.AutomationElements.Window window, string nameAutomationId, int channel)
     {
-        if (string.IsNullOrWhiteSpace(rxPath)) return null;
-        var matches = AutomationIdRegex.Matches(rxPath);
-        return matches.Count > 0 ? matches[^1].Groups[1].Value : null;
+        string wanted = "Channel " + channel + " Parameters";
+        for (int step = 0; step < 20; step++)
+        {
+            var crumb = window.FindFirstDescendant(cf => cf.ByAutomationId("BreadCrumb"));
+            string text = crumb == null ? "" : string.Join("", RawTexts(crumb, 0));
+            if (text.Contains(wanted, StringComparison.Ordinal))
+            {
+                return FindWithRetry(window, nameAutomationId);
+            }
+
+            var next = window.FindFirstDescendant(cf => cf.ByHelpText("Next Result"));
+            if (next == null || !next.IsEnabled)
+            {
+                return null;
+            }
+
+            next.AsButton().Invoke();
+            Thread.Sleep(900);
+        }
+
+        return null;
     }
 
-    private List<(string, string, string, string, string)> ReadTestData()
+    private List<(string, string, string, string, string, int)> ReadTestData()
     {
         using var workbook = new XLWorkbook(_excelPath);
-        var result = new List<(string, string, string, string, string)>();
+        var result = new List<(string, string, string, string, string, int)>();
 
         foreach (var sheetName in _sheetNames)
         {
@@ -336,12 +364,15 @@ public class ConfigureParametersTest
             var ws = workbook.Worksheet(sheetName);
             foreach (var row in ws.RowsUsed().Skip(1)) // skip header
             {
+                string scope = row.Cell(1).GetString().Trim();        // "System" or the channel number
+                int.TryParse(scope, out int channelNumber);
                 result.Add((
-                    row.Cell(1).GetString().Trim(),
+                    (channelNumber > 0 ? "Ch" + channelNumber + " r" : "r") + row.RowNumber(),
                     row.Cell(2).GetString().Trim(),
                     row.Cell(3).GetString().Trim(),
                     row.Cell(4).GetString().Trim(),
-                    row.Cell(5).GetString().Trim()
+                    row.Cell(5).GetString().Trim(),
+                    channelNumber
                 ));
             }
         }
