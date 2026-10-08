@@ -13,7 +13,7 @@ string logPath = Path.Combine(AppContext.BaseDirectory, "GUIAutomationLog_" + Da
 void Log(string line)
 {
     string stamped = DateTime.Now.ToString("HH:mm:ss.fff") + "  " + line;
-    File.AppendAllText(logPath, stamped + Environment.NewLine);   // the file keeps the plain one-line-per-event text
+    File.AppendAllText(logPath, stamped + Environment.NewLine, new System.Text.UTF8Encoding(true));   // the file keeps the plain one-line-per-event text
     PrintColored(stamped, line);
 }
 
@@ -139,7 +139,9 @@ void ShowTestBanner(string? choice, UnitProfile? bannerUnit)
     }
 
     Console.WriteLine();
-    File.AppendAllText(logPath, Environment.NewLine + "=================== TEST SELECTED: " + title + " | " + unitText + " ===================" + Environment.NewLine);
+    // the same box goes into the log file (UTF-8 with BOM so the box characters display correctly in Notepad), plus a greppable line
+    File.AppendAllText(logPath, Environment.NewLine + string.Join(Environment.NewLine, box) + Environment.NewLine
+                       + "TEST SELECTED: " + title + " | " + unitText + Environment.NewLine + Environment.NewLine, new System.Text.UTF8Encoding(true));
 }
 
 // The master workbook must exist at ExcelPath and be CLOSED in Excel while a test runs (an open workbook is locked / may be saved over).

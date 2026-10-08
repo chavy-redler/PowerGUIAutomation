@@ -388,7 +388,13 @@ public class ConfigureRandomChangeTest
             _log("WARN  | " + p.Label + " | before the test the value is '" + before + "' but the Excel default is '" + p.Default + "' (the unit is not at its default)");
         }
 
-        var tip = ReadTooltip(window, nameEl);
+        // The tooltip text is already inside the parameter's row (hidden) - read it from there; hovering is only the fallback.
+        var tip = ReadConstraintsFromRow(valueEl);
+        if (!tip.Found)
+        {
+            tip = ReadTooltip(window, nameEl);
+        }
+
         _log("READ  | " + p.Label + " | control=" + type + " | current='" + before + "' | excel default='" + p.Default + "'"
              + (tip.Found ? " | tooltip: Min=" + Fmt(tip.Min) + " Max=" + Fmt(tip.Max) + " Default=" + tip.DefaultText + " type=" + tip.TypeToken : " | (no tooltip)"));
 
@@ -618,6 +624,15 @@ public class ConfigureRandomChangeTest
             {
                 why = "no Min/Max in the tooltip and the current value '" + current + "' is not numeric";
                 return null;
+            }
+
+            // [%] without a range (Log. I TH Event, Soft-Start/Stop PWM Duty Cycle): current value +1 or -1 (never below 0)
+            if (tip.TypeToken.Trim().Trim('[', ']') == "%")
+            {
+                int pctDec = cleaned.Contains('.') ? cleaned.Length - cleaned.IndexOf('.') - 1 : 0;
+                double pctNew = curNum - 1 >= 0 && _random.Next(2) == 0 ? curNum - 1 : curNum + 1;
+                why = "no Min/Max in the tooltip - [%] parameter: current value " + (pctNew > curNum ? "+1" : "-1");
+                return pctNew.ToString("F" + pctDec, CultureInfo.InvariantCulture);
             }
 
             double? byUnit = UnitTestValue(tip.TypeToken);
@@ -1205,6 +1220,60 @@ public class ConfigureRandomChangeTest
     }
 
     // ------------------------------------------------------------------ tooltip
+
+    private static readonly Regex ConstraintsRegex = new(@"Min:\s*(-?[\d.,]+)[^\w-]+Max:\s*(-?[\d.,]+)", RegexOptions.Compiled);
+    private static readonly Regex DefaultRegex = new(@"Default:\s*(.+)$", RegexOptions.Compiled);
+
+    // Reads "Constraints: Min: X • Max: Y • Default: Z" and the unit/data-type label straight from the row's UIA tree - no hovering.
+    // The separator is the bullet character (U+2022), not a space. Found=false when the row has no Constraints text (e.g. the three % parameters).
+    private static Tip ReadConstraintsFromRow(AutomationElement valueEl)
+    {
+        var tip = new Tip();
+        try
+        {
+            var row = valueEl.Parent;
+            for (int up = 0; up < 3 && row != null && tip.Text.Length == 0; up++, row = row.Parent)
+            {
+                foreach (var t in Walk(row).Where(x => x.ControlType == ControlType.Text))
+                {
+                    string text = (t.Name ?? "").Trim();
+                    if (text.Contains("Constraints:", StringComparison.Ordinal))
+                    {
+                        tip.Text = text;
+                        var m = ConstraintsRegex.Match(text);
+                        if (m.Success && TryNum(m.Groups[1].Value.Replace(",", ""), out double mn) && TryNum(m.Groups[2].Value.Replace(",", ""), out double mx))
+                        {
+                            tip.Min = mn;
+                            tip.Max = mx;
+                        }
+
+                        var d = DefaultRegex.Match(text);
+                        if (d.Success)
+                        {
+                            tip.DefaultText = d.Groups[1].Value.Trim();
+                        }
+
+                        break;
+                    }
+                }
+
+                if (tip.Text.Length > 0)
+                {
+                    // the visible unit ("[msec]", "[%]") or data type ("String") label of the same row
+                    tip.TypeToken = Walk(row).Where(x => x.ControlType == ControlType.Text && !x.Properties.IsOffscreen.ValueOrDefault)
+                        .Select(x => (x.Name ?? "").Trim())
+                        .FirstOrDefault(x => Regex.IsMatch(x, @"^\[.+\]$") || x.Equals("String", StringComparison.OrdinalIgnoreCase)) ?? "";
+                    tip.Found = true;
+                }
+            }
+        }
+        catch
+        {
+            // fall back to hovering
+        }
+
+        return tip;
+    }
 
     // Hover the parameter name; the tooltip carries "Constraints: Min: .. Max: .. Default: .." plus MIN/MAX/DEFAULT cells
     // and a type token ("String", ...).

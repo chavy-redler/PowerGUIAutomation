@@ -30,6 +30,8 @@ GUI automation (FlaUI / UIA3, net10.0-windows) for Power Rider Studio. This file
 | 4 | Configure - AutomationId scan | read-only; report goes to a new workbook in the `Excel` folder |
 | 5 | Debug - Configure comparison on a subset | read-only; runs test 2 only on chosen channels (`15`, `13,15`, `S,15`) and/or parameters whose name contains a text |
 
+Test 2 (and 5) compare by **page scan**: they select the tree node "System Parameters" / "Channel N Parameters", scroll that scope's parameter list and compare every wanted row as it appears (a row not seen is looked up with the search box). This replaced one search per parameter, which took hours.
+
 Test 2 (and 5) log, for every channel parameter, what the GUI itself shows as the displayed channel (`breadcrumb='… Channel 15 Parameters' | result 15 of 16`). If the wanted channel cannot be reached the test fails; it never compares against another channel's value.
 
 Per-test details: to be added.
