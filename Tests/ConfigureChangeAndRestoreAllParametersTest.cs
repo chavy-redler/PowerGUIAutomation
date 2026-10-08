@@ -1,7 +1,6 @@
 using System.Diagnostics;
 using System.Globalization;
 using System.Text;
-using System.Text.Json;
 using System.Text.RegularExpressions;
 using System.Threading;
 using ClosedXML.Excel;
@@ -13,47 +12,33 @@ using FlaUI.UIA3;
 
 namespace PowerGUIAutomation.Tests;
 
-// Random sampling "change -> save -> fetch -> verify -> restore default" test of the Configure tab.
+// "Change and restore EVERY parameter" test of the Configure tab, one parameter after the other, in the order of the unit's Excel sheet
+// (System, then channel 1..N, then the Group Control page). Parameters are found the same fast way as in ConfigureCompareParametersToExcelTest:
+// select the tree node of the scope ("System Parameters" / "Channel N Parameters" / "Group Channel Control") and scroll its list
+// (see ConfigureNav); the search box is only the fallback.
 //
-// Locating a parameter works exactly like ConfigureParametersTest: the parameter row comes from the
-// "System Parameters" / "Channel Parameters" sheets (AutomationIds parsed out of the Parameter/Value path
-// columns), and the Configure tab's own search box (paste, not typing) brings it into view.
+// For every parameter:
+//   1. find it and read its current value + the Constraints text of its row (Min / Max / Default)
+//   2. pick a different valid value and set it
+//   3. Save (Save to Unit Flash), Fetch Parameters, verify the new value is really what the unit returns
+//   4. set the Excel default (the "Value (default)" column) back, Save, Fetch, verify it is back at the default
+// The restore is attempted even if the change failed. The test stops at the first failure.
 //
-// One run checks SampleSize (10) parameters, ONE AT A TIME:
-//   1. read the current value + the tooltip (Min / Max / Default) and pick a new valid value
-//        - numeric: random value inside [Min, Max], different from the current one
-//        - string:  random text inside the allowed length
-//        - choice (ComboBox / CheckBox): an option that has not been tried yet for this parameter (else any other)
-//   2. set it, Save (Save to Unit Flash), Fetch Parameters (a Reset Unit step exists but is OFF, see DoReset), verify it really changed
-//   3. mark it as tested for THIS GUI version (Excel columns, see below)
-//   4. restore the Excel default (the Excel "Value" column is the default), Save / Fetch, verify
-//      it is back to the default - the restore is attempted even if step 2 failed
-// At least MinChoicePerSample of the 10 are choice parameters (sampling quota).
+// New value: numeric = random inside the row's [Min, Max] (different from the current one); no range = by unit ([msec]=10, [sec]=1,
+// [%] = current +-1); text = QA.... A choice parameter (ComboBox / check box) is different: EVERY other option is tried in list order
+// (each one: set, Save, Fetch, verify) and the default is restored only once, after the last option. Parameters that cannot be tested are skipped with the reason:
+// CAN Bus Baud Rate, Serial Baud Rate, Destination Address, Unit ID Address, Logic Control / Logic Expression, Channel N Group Control, read-only controls
+// and parameters with no range and no unit rule.
 //
-// "Already tested" is stored in a SEPARATE workbook (PowerGUIAutomation\ConfigureRandomChange_Tested.xlsx, sheet "<PN> Tested").
-// A parameter counts as tested only when its stored GUI version equals the CURRENT one (Product version incl. commit,
-// read from the running exe) - a new GUI build makes every parameter untested again. It is marked ONLY after the
-// change was verified AND the restore to the Excel default was verified; only then is the next parameter drawn.
-//
-// Parameters that must never be changed (not changeable in this GUI): CAN Bus Baud Rate, Serial Baud Rate,
-// Destination Address, Unit ID Address.
-//
-// SAFETY: the real run WRITES parameters to the connected unit, saves them to flash (and resets the unit only if DoReset is turned on). It
-// asks for an explicit "YES". Only the real run is offered; a dry-run path (finds the parameters, reads tooltip/values
-// and logs what it WOULD change, edits nothing) is still in the code behind AllowDryRun.
-public class ConfigureRandomChangeTest
+// SAFETY: this test WRITES parameters to the connected unit and saves them to flash (Reset Unit only if DoReset is on). There is no
+// confirmation question here; the only prompt is the "unit was reset to default?" check of the main menu (Program.cs).
+public class ConfigureChangeAndRestoreAllParametersTest
 {
-    private const int DefaultSampleSize = 10;
-    private const int DefaultMinChoice = 2;
-    private int SampleSize = DefaultSampleSize;           // asked at start (default 10)
-    private int MinChoicePerSample = DefaultMinChoice;    // 2 of 10 must be choice (ComboBox) parameters
     private const int MaxFindRetries = 12;
     private const int RetryDelayMs = 400;
-    // Reset Unit takes a long time (the unit restarts and the GUI reconnects) and is OFF by default. Without it the test proves that the
-    // unit ACCEPTED the saved value (Fetch reads it back from the unit) but not that it survives a restart. Set to true to include it.
+    // Reset Unit takes a long time (the unit restarts and the GUI reconnects) and is OFF. Without it the test proves that the unit
+    // ACCEPTED the saved value (Fetch reads it back from the unit) but not that it survives a restart.
     private const bool DoReset = false;
-    // The dry run is not offered in the menu any more; true brings the "DRY RUN / REAL RUN" question back.
-    private const bool AllowDryRun = false;
     private const int SaveTimeoutMs = 20000;
     private const int ResetTimeoutMs = 45000;
     private const int FetchTimeoutMs = 25000;
@@ -62,6 +47,9 @@ public class ConfigureRandomChangeTest
     {
         "CAN Bus Baud Rate", "Serial Baud Rate", "Destination Address", "Unit ID Address",
     };
+
+    // never changed by this test: the NeverChange names, Logic Control / Logic Expression, and every "Channel N Group Control" (Group Channel Control page)
+    private static bool NotChanged(Param p) => NeverChange.Contains(p.Name) || IsLogicParam(p.Name) || p.Scope == ConfigureNav.GroupScope;
 
     private static readonly Regex BracketedRegex = new(@"^\[\s*([^,\]]+?)\s*[,\]]");
 
@@ -72,12 +60,12 @@ public class ConfigureRandomChangeTest
 
     // First failure of the run, for the closing "RESULT" explanation.
     private string _failParam = "", _failStep = "", _failWhy = "", _failCheck = "";
-    private bool _dryRun = true;
     private string _guiVersion = "";
+    private readonly Dictionary<int, double> _lastPct = new();      // per scope: scroll position where the previous parameter was found
 
     private AutomationElement? _logElement;
 
-    public ConfigureRandomChangeTest(string excelPath, Action<string> log, UnitProfile unit)
+    public ConfigureChangeAndRestoreAllParametersTest(string excelPath, Action<string> log, UnitProfile unit)
     {
         _excelPath = excelPath;
         _log = log;
@@ -85,6 +73,25 @@ public class ConfigureRandomChangeTest
     }
 
     private string[] Sheets => new[] { _unit.ParameterSheet };
+
+    // ------------------------------------------------------------------ model
+
+    private sealed class Param
+    {
+        public string Sheet = "", Name = "", NameId = "", ValueId = "", Default = "";
+        public int ExcelRow, Channel;                 // Channel 0 = system parameter
+        public int Scope => ConfigureNav.ScopeOf(Channel, Name);     // tree page: 0 = System, 1..N = channel, ConfigureNav.GroupScope = Group Channel Control
+        public string Label => (Channel > 0 ? "Channel " + Channel + " | " : "System | ") + Name + " (" + Sheet + " row " + ExcelRow + ")";
+    }
+
+    private sealed class Tip
+    {
+        public string Text = "";
+        public double? Min, Max;
+        public string DefaultText = "";
+        public string TypeToken = "";
+        public bool Found;
+    }
 
     // One place that reports a failure the same way every time: which parameter, which STEP of the test,
     // WHY it failed and what to check. The first one is repeated in the closing RESULT lines.
@@ -101,10 +108,10 @@ public class ConfigureRandomChangeTest
         }
     }
 
-    private void LogResult(bool passed, int done, int passedCount, bool restored)
+    private void LogResult(bool passed, int done, int passedCount, bool restored, int skipped)
     {
         _log("RESULT| " + new string('=', 90));
-        _log("RESULT| " + (passed ? "PASSED" : "FAILED") + " | unit=" + _unit.Name + " | parameters checked=" + done + " passed=" + passedCount + " | mode=" + (_dryRun ? "DRY RUN" : "REAL RUN"));
+        _log("RESULT| " + (passed ? "PASSED" : "FAILED") + " | unit=" + _unit.Name + " | parameters changed+restored=" + passedCount + " of " + done + " checked | skipped=" + skipped);
         if (!passed && _failStep.Length > 0)
         {
             _log("RESULT| failed parameter : " + _failParam);
@@ -116,34 +123,6 @@ public class ConfigureRandomChangeTest
         }
 
         _log("RESULT| " + new string('=', 90));
-    }
-
-    // ------------------------------------------------------------------ model
-
-    private sealed class Param
-    {
-        public string Sheet = "", Name = "", NameId = "", ValueId = "", Default = "";
-        public int ExcelRow, Channel;                 // Channel 0 = system parameter
-        public string Key => Sheet + "|" + Channel + "|" + Name;   // stable even if rows move in the master
-        public string Label => (Channel > 0 ? "Channel " + Channel + " | " : "System | ") + Name + " (" + Sheet + " row " + ExcelRow + ")";
-        public string KnownType = "";                 // "Edit" / "ComboBox" / "CheckBox" once seen
-    }
-
-    private sealed class State
-    {
-        public string Version { get; set; } = "";
-        public string Date { get; set; } = "";
-        public string Tried { get; set; } = "";       // values/options tried so far (| separated, all versions)
-        public string Type { get; set; } = "";
-    }
-
-    private sealed class Tip
-    {
-        public string Text = "";
-        public double? Min, Max;
-        public string DefaultText = "";
-        public string TypeToken = "";
-        public bool Found;
     }
 
     // ------------------------------------------------------------------ entry point
@@ -158,83 +137,43 @@ public class ConfigureRandomChangeTest
         }
 
         Console.WriteLine();
-        Console.WriteLine("Configure random-change test | GUI version: " + _guiVersion);
+        Console.WriteLine("Configure change-and-restore test | GUI version: " + _guiVersion);
+        Console.WriteLine();
+        Console.WriteLine("WARNING: this test WRITES parameters to the connected unit and saves them to flash (change, Save, Fetch, restore default).");
+        Console.WriteLine();
 
-        // This test only offers the REAL RUN. The dry-run path (find + read + log what WOULD change, no edits) is still in the
-        // code: set AllowDryRun to true to get the mode question back.
-        _dryRun = false;
-        if (AllowDryRun)
-        {
-            Console.WriteLine("  1. DRY RUN  - find parameters, read tooltips, log what would be changed (no edits)  [default]");
-            Console.WriteLine("  2. REAL RUN - change " + SampleSize + " parameters, Save + Fetch, verify, restore defaults");
-            Console.Write("Mode: ");
-            _dryRun = Console.ReadLine()?.Trim() != "2";
-        }
-
-        if (!_dryRun)
-        {
-            Console.WriteLine();
-            Console.WriteLine("WARNING: this WRITES parameters to the connected unit and saves them to flash (change, Save, Fetch, restore default).");
-            Console.Write("Type YES to continue: ");
-            if (!string.Equals(Console.ReadLine()?.Trim(), "YES", StringComparison.Ordinal))
-            {
-                _log("ABORT | real run not confirmed");
-                return false;
-            }
-        }
-
-        Console.Write("How many parameters to check in this run? [" + DefaultSampleSize + "]: ");
-        if (int.TryParse(Console.ReadLine()?.Trim(), out int requested) && requested >= 1 && requested <= 50)
-        {
-            SampleSize = requested;
-        }
-
-        MinChoicePerSample = Math.Min(DefaultMinChoice, SampleSize);
-        if (SampleSize < DefaultSampleSize)
-        {
-            MinChoicePerSample = SampleSize >= 5 ? 1 : 0;      // the 2-of-10 quota only makes sense for a full sample
-        }
-
-        _log("START | Configure random-change test | unit=" + _unit.Name + " (sheets '" + _unit.ParameterSheet + "') | mode=" + (_dryRun ? "DRY RUN" : "REAL RUN") + " | GUI version=" + _guiVersion);
+        _log("START | Configure change-and-restore test | unit=" + _unit.Name + " (sheet '" + _unit.ParameterSheet + "') | GUI version=" + _guiVersion
+             + " | every parameter of the sheet");
 
         List<Param> all;
-        Dictionary<string, State> state;
         try
         {
             all = ReadParams();
-            state = LoadState(all);
         }
         catch (Exception ex)
         {
-            Fail(null, "read the Excel", "could not read parameters/state from sheets '" + _unit.ParameterSheet + "': " + ex.Message,
-                 "the workbook path, and that both sheets exist for unit '" + _unit.Name + "'");
-            LogResult(false, 0, 0, true);
+            Fail(null, "read the Excel", "could not read parameters from sheet '" + _unit.ParameterSheet + "': " + ex.Message,
+                 "the workbook path, and that the sheet exists for unit '" + _unit.Name + "'");
+            LogResult(false, 0, 0, true, 0);
             return false;
         }
 
         if (all.Count == 0)
         {
-            Fail(null, "read the Excel", "no parameters were found for unit " + _unit.PartNumber + ": the sheets '" + _unit.ParameterSheet + "' are missing or empty in the workbook",
-                 "create these two sheets for " + _unit.PartNumber + " (same columns as the RD152 sheets) or pick another unit");
-            LogResult(false, 0, 0, true);
+            Fail(null, "read the Excel", "no parameters were found for unit " + _unit.PartNumber + ": the sheet '" + _unit.ParameterSheet + "' is missing or empty in the workbook",
+                 "create this sheet for " + _unit.PartNumber + " (same columns as the RD152 sheet) or pick another unit");
+            LogResult(false, 0, 0, true, 0);
             return false;
         }
 
         all = all.Where(p => p.Channel <= _unit.Channels).ToList();      // a 12-channel unit has no channel 13..16
-        var candidates = all.Where(p => !NeverChange.Contains(p.Name) && !IsLogicParam(p.Name)).ToList();
-        var untested = candidates.Where(p => !IsTestedNow(state, p)).ToList();
-        int changedVersion = state.Values.Count(s => s.Version.Length > 0 && s.Version != _guiVersion);
-        if (changedVersion > 0)
+        var excluded = all.Where(NotChanged).ToList();
+        var todo = all.Where(p => !NotChanged(p)).ToList();
+        _log("INFO  | parameters in Excel=" + all.Count + " | never changed (baud rates, addresses, logic, group control)=" + excluded.Count + " | to check in this run=" + todo.Count);
+        if (todo.Count == 0)
         {
-            _log("INFO  | GUI version differs from the version of " + changedVersion + " earlier results -> those parameters are untested again");
-        }
-
-        _log("INFO  | parameters in Excel=" + all.Count + " | excluded (cannot be changed)=" + (all.Count - candidates.Count)
-             + " | tested on this GUI version=" + (candidates.Count - untested.Count) + " | still untested=" + untested.Count);
-        if (untested.Count == 0)
-        {
-            _log("DONE  | every parameter was already tested on GUI version " + _guiVersion);
-            return true;
+            _log("FAIL  | nothing to check - the sheet has no changeable parameter");
+            return false;
         }
 
         using var automation = new UIA3Automation();
@@ -244,7 +183,7 @@ public class ConfigureRandomChangeTest
         if (unitProblem != null)
         {
             Fail(null, "check the connected unit", unitProblem, "connect the unit '" + _unit.Name + "' (Manage Units) or choose the right unit in the main menu");
-            LogResult(false, 0, 0, true);
+            LogResult(false, 0, 0, true, 0);
             return false;
         }
 
@@ -252,7 +191,7 @@ public class ConfigureRandomChangeTest
         if (!WaitFetchDone(window, 300000, "Configure tab just opened"))
         {
             Fail(null, "open the Configure tab", "the GUI kept 'Fetching parameters...' for more than 5 minutes", "is the unit connected and responding? (status bar shows BUS CONFLICT?)");
-            LogResult(false, 0, 0, true);
+            LogResult(false, 0, 0, true, 0);
             return false;
         }
 
@@ -260,71 +199,41 @@ public class ConfigureRandomChangeTest
         if (searchElement == null)
         {
             Fail(null, "open the Configure tab", "the search box (searchTextBox) was not found", "is the Configure tab open and a unit connected?");
-            LogResult(false, 0, 0, true);
+            LogResult(false, 0, 0, true, 0);
             return false;
         }
 
         var search = searchElement.AsTextBox();
         _logElement = window.FindFirstDescendant(cf => cf.ByAutomationId("ConfigureLog"));
 
-        int done = 0, choiceDone = 0, passed = 0;
-        int attempts = 0;
-        var skippedThisRun = new HashSet<string>();
-
-        while (done < SampleSize && attempts++ < SampleSize * 6)
+        int done = 0, passed = 0, skipped = 0, index = 0;
+        var watch = Stopwatch.StartNew();
+        foreach (var p in todo)
         {
-            int remaining = SampleSize - done;
-            bool mustBeChoice = choiceDone < MinChoicePerSample && remaining <= MinChoicePerSample - choiceDone;
-            var pool = untested.Where(p => !skippedThisRun.Contains(p.Key)).ToList();
-            if (pool.Count == 0)
-            {
-                _log("INFO  | no more untested parameters to draw from");
-                break;
-            }
-
-            // prefer known choice parameters while the quota is still open (a choice parameter is needed
-            // soon), otherwise draw uniformly from everything that is untested
-            Param pick;
-            var knownChoice = pool.Where(p => p.KnownType is "ComboBox" or "CheckBox").ToList();
-            bool wantChoice = choiceDone < MinChoicePerSample && (mustBeChoice || _random.Next(SampleSize) < MinChoicePerSample * 2);
-            pick = wantChoice && knownChoice.Count > 0 ? knownChoice[_random.Next(knownChoice.Count)] : pool[_random.Next(pool.Count)];
-
-            _log("DRAW  | " + (done + 1) + "/" + SampleSize + " | " + pick.Label + (mustBeChoice ? " | (choice parameter required)" : ""));
-
-            var outcome = TestOne(window, search, pick, mustBeChoice, state, out bool isChoice);
+            index++;
+            _log("DRAW  | " + index + "/" + todo.Count + " | " + p.Label);
+            var outcome = TestOne(window, search, p);
             if (outcome == Outcome.Skipped)
             {
-                skippedThisRun.Add(pick.Key);
+                skipped++;
                 continue;
             }
 
             done++;
-            if (isChoice)
-            {
-                choiceDone++;
-            }
-
             if (outcome == Outcome.Failed)
             {
                 _log("STOPPED | halted after first failure - remaining parameters were not checked");
                 ClearSearch(window);
-                LogResult(false, done, passed, _lastRestored);
+                LogResult(false, done, passed, _lastRestored, skipped);
                 return false;
             }
 
             passed++;
-            untested.Remove(pick);
         }
 
         ClearSearch(window);
-
-        _log("DONE  | checked=" + done + " passed=" + passed + " choice parameters=" + choiceDone + " | mode=" + (_dryRun ? "DRY RUN" : "REAL RUN"));
-        LogResult(true, done, passed, true);
-        if (done < SampleSize)
-        {
-            _log("NOTE  | fewer than " + SampleSize + " parameters could be checked (skips/pool exhausted)");
-        }
-
+        _log("DONE  | checked=" + done + " passed=" + passed + " skipped=" + skipped + " | " + watch.Elapsed.TotalMinutes.ToString("0.0") + " min");
+        LogResult(true, done, passed, true, skipped);
         return true;
     }
 
@@ -334,34 +243,110 @@ public class ConfigureRandomChangeTest
 
     private bool _lastRestored = true;
 
-    // The unit under test must be the unit that is connected: the Excel defaults are for THIS unit and a real run writes to it.
+    // The unit under test must be the unit that is connected: the Excel defaults are for THIS unit and the run writes to it.
     private string? VerifyUnit(Window window) => UnitCheck.Verify(window, _unit, _log);
 
-    private Outcome TestOne(Window window, TextBox search, Param p, bool mustBeChoice, Dictionary<string, State> state, out bool isChoice)
+    // Finds the parameter's name + value elements: select the scope's tree page and scroll to the row (the previous parameter's position is
+    // the starting point, the rows come in list order); if that fails, the search box.
+    private (AutomationElement? name, AutomationElement? value) LocateRow(Window window, TextBox search, Param p, bool refresh)
     {
-        isChoice = false;
+        if (!WaitFetchDone(window, 300000, "before locating " + p.Name))
+        {
+            Fail(p, "1 locate the parameter", "the GUI kept 'Fetching parameters...' for more than 5 minutes", "is the unit connected and responding? (status bar shows BUS CONFLICT?)");
+            return (null, null);
+        }
+
+        var found = LocateOnPage(window, p);
+        if (found.name != null)
+        {
+            return found;
+        }
+
+        _log("INFO  | " + p.Label + " | not found by the page scan - using the search box");
+        return Locate(window, search, p, refresh);
+    }
+
+    private (AutomationElement? name, AutomationElement? value) LocateOnPage(Window window, Param p)
+    {
+        try
+        {
+            string? crumb = ConfigureNav.SelectScope(window, p.Scope);      // re-selecting rebuilds the list (also after Save/Fetch)
+            if (crumb == null)
+            {
+                return (null, null);
+            }
+
+            var list = window.FindFirstDescendant(cf => cf.ByAutomationId("ParametersList"));
+            if (list == null)
+            {
+                return (null, null);
+            }
+
+            double view = 100;
+            var scroll = list.Patterns.Scroll.PatternOrDefault;
+            bool scrollable = scroll != null && scroll.VerticallyScrollable.ValueOrDefault;
+            if (scrollable)
+            {
+                view = Math.Max(5, scroll!.VerticalViewSize.ValueOrDefault);
+            }
+
+            double start = _lastPct.TryGetValue(p.Scope, out double last) ? Math.Max(0, last - view / 2) : 0;
+            foreach (double from in new[] { start, 0 })
+            {
+                for (double pct = from; ; pct += view / 2)
+                {
+                    list = window.FindFirstDescendant(cf => cf.ByAutomationId("ParametersList")) ?? list;
+                    scroll = list.Patterns.Scroll.PatternOrDefault;
+                    if (scrollable && scroll != null)
+                    {
+                        scroll.SetScrollPercent(-1, Math.Min(pct, 100));
+                        Thread.Sleep(150);
+                    }
+
+                    var nameEl = list.FindFirstDescendant(cf => cf.ByAutomationId(p.NameId));
+                    var valueEl = list.FindFirstDescendant(cf => cf.ByAutomationId(p.ValueId));
+                    if (nameEl != null && valueEl != null && (nameEl.Name ?? "").Trim() == p.Name)
+                    {
+                        _lastPct[p.Scope] = Math.Min(pct, 100);
+                        return (nameEl, valueEl);
+                    }
+
+                    if (!scrollable || pct >= 100)
+                    {
+                        break;
+                    }
+                }
+
+                if (start == 0)
+                {
+                    break;
+                }
+            }
+        }
+        catch (Exception ex) when (ex is FlaUI.Core.Exceptions.PropertyNotSupportedException or FlaUI.Core.Exceptions.ElementNotAvailableException or System.Runtime.InteropServices.COMException or InvalidOperationException)
+        {
+            _log("NOTE  | " + p.Label + " | page scan interrupted (" + ex.GetType().Name + ")");
+        }
+
+        return (null, null);
+    }
+
+    private Outcome TestOne(Window window, TextBox search, Param p)
+    {
         _lastRestored = true;
 
-        _log("STEP  | 1 draw a random parameter and find it (search box + result navigation)");
-        var (nameEl, valueEl) = Locate(window, search, p);
+        _log("STEP  | 1 find the parameter (tree page scan)");
+        var (nameEl, valueEl) = LocateRow(window, search, p, refresh: false);
         if (nameEl == null || valueEl == null)
         {
-            Fail(p, "1 locate the parameter", "the parameter row was not found on screen after searching '" + p.Name + "' (ids " + p.NameId + " / " + p.ValueId + ")",
-                 "is the Configure tab open? does the search show '" + (p.Channel > 0 ? "Channel " + p.Channel : "System") + "' results (breadcrumb)?");
+            Fail(p, "1 locate the parameter", "the parameter row was not found on screen (ids " + p.NameId + " / " + p.ValueId + ")",
+                 "is the Configure tab open? does the page '" + (p.Channel > 0 ? "Channel " + p.Channel : "System") + "' list the parameter?");
             return Outcome.Failed;
         }
 
         string type = valueEl.ControlType.ToString();
-        p.KnownType = type;
-        isChoice = valueEl.ControlType == ControlType.ComboBox || valueEl.ControlType == ControlType.CheckBox;
-        if (mustBeChoice && !isChoice)
-        {
-            _log("SKIP  | " + p.Label + " | not a choice parameter (" + type + ") - a choice parameter is still required");
-            RememberType(state, p, type);
-            return Outcome.Skipped;
-        }
 
-        _log("STEP  | 2 read the current value and the tooltip (range)");
+        _log("STEP  | 2 read the current value and the constraints (range)");
         string before = ReadParam(window, p, out var freshValueEl, 4);
         valueEl = freshValueEl ?? valueEl;
         if (before.Length == 0)
@@ -388,7 +373,7 @@ public class ConfigureRandomChangeTest
             _log("WARN  | " + p.Label + " | before the test the value is '" + before + "' but the Excel default is '" + p.Default + "' (the unit is not at its default)");
         }
 
-        // The tooltip text is already inside the parameter's row (hidden) - read it from there; hovering is only the fallback.
+        // The constraints text is already inside the parameter's row (hidden) - read it from there; hovering is only the fallback.
         var tip = ReadConstraintsFromRow(valueEl);
         if (!tip.Found)
         {
@@ -396,78 +381,72 @@ public class ConfigureRandomChangeTest
         }
 
         _log("READ  | " + p.Label + " | control=" + type + " | current='" + before + "' | excel default='" + p.Default + "'"
-             + (tip.Found ? " | tooltip: Min=" + Fmt(tip.Min) + " Max=" + Fmt(tip.Max) + " Default=" + tip.DefaultText + " type=" + tip.TypeToken : " | (no tooltip)"));
+             + (tip.Found ? " | constraints: Min=" + Fmt(tip.Min) + " Max=" + Fmt(tip.Max) + " Default=" + tip.DefaultText + " unit/type=" + tip.TypeToken : " | (no constraints text)"));
 
         if (IsReadOnly(valueEl))
         {
             _log("SKIP  | " + p.Label + " | value control is read-only");
-            RememberType(state, p, type);
             return Outcome.Skipped;
         }
 
-        _log("STEP  | 3 choose a new value");
-        string? newValue = ChooseNewValue(valueEl, p, before, tip, state, out string why);
-        if (newValue == null)
+        _log("STEP  | 3 change the value (choose a new value and set it in the GUI)");
+        // Choice parameters (ComboBox / check box): EVERY other option is tried, in list (index) order, without restoring the default in
+        // between; the default is restored once, after the last option. Any other parameter gets one new value.
+        var plan = new List<(string value, string why)>();
+        if (valueEl.ControlType == ControlType.ComboBox || valueEl.ControlType == ControlType.CheckBox)
         {
-            _log("SKIP  | " + p.Label + " | " + why);
-            RememberType(state, p, type);
-            return Outcome.Skipped;
-        }
+            var options = valueEl.ControlType == ControlType.ComboBox ? ReadOptions(valueEl) : new List<string> { "On", "Off" };
+            string cur = Normalize(before);
+            var targets = options.Where(o => !SameValue(o, cur)).ToList();
+            if (targets.Count == 0)
+            {
+                _log("SKIP  | " + p.Label + " | choice parameter with fewer than 2 options");
+                return Outcome.Skipped;
+            }
 
-        _log("CHANGE| " + p.Label + " | '" + before + "' -> '" + newValue + "' | " + why);
-        if (_dryRun)
+            for (int i = 0; i < targets.Count; i++)
+            {
+                plan.Add((targets[i], "option " + (i + 1) + " of " + targets.Count + " (list order) | all options=" + string.Join(", ", options)));
+            }
+        }
+        else
         {
-            _log("DRY   | " + p.Label + " | would set '" + newValue + "', Save, Fetch, verify, then restore '" + p.Default + "' (nothing was changed)");
-            return Outcome.Passed;
+            string? newValue = ChooseNewValue(valueEl, p, before, tip, out string why);
+            if (newValue == null)
+            {
+                _log("SKIP  | " + p.Label + " | " + why);
+                return Outcome.Skipped;
+            }
+
+            plan.Add((newValue, why));
         }
 
         bool ok = true;
-        string? changedValueUsed = null;     // set once the change itself was verified; MARK happens only after the restore is verified too
         try
         {
-            _log("STEP  | 4 set the new value in the GUI");
-            SetValue(window, valueEl, newValue);
-            string shownNow = ReadParam(window, p, out _);
-            _log("SET   | " + p.Label + " | the GUI now shows '" + shownNow + "' (wanted '" + newValue + "')");
-            if (!SameValue(shownNow, newValue))
+            for (int i = 0; i < plan.Count && ok; i++)
             {
-                Fail(p, "4 set the new value", "after setting '" + newValue + "' the control shows '" + shownNow + "'",
-                     "the value was rejected/not committed (range, focus) - look at the Configure screen");
-                ok = false;
-            }
-            else if (!WaitSaveEnabled(window))
-            {
-                Fail(p, "4 set the new value", "the value shows '" + shownNow + "' but 'Save to Unit Flash' stayed DISABLED - the GUI did not register a pending change",
-                     "the edit was probably not committed (needs Enter/focus change?) or equals the stored value");
-                ok = false;
-            }
-
-            if (ok)
-            {
-                _log("STEP  | 5 Save to Unit Flash" + (DoReset ? ", Reset Unit" : "") + ", Fetch Parameters");
-                ok &= SaveResetFetch(window, search, p);
-            }
-
-            if (ok)
-            {
-                _log("STEP  | 6 verify the value after Save / Fetch");
-                var (_, v2) = Locate(window, search, p, clearFirst: true);
-                string after = v2 == null ? "<NOT FOUND>" : ReadParam(window, p, out _);
-                bool changed = SameValue(after, newValue);
-                _log((changed ? "PASS  | " : "FAIL  | ") + p.Label + " | after Save/Fetch: expected='" + newValue + "' actual='" + after + "'");
-                if (!changed)
+                if (i > 0)
                 {
-                    Fail(p, "6 verify after Save/Fetch", "expected '" + newValue + "' but the unit returned '" + after + "' after fetching",
-                         "the unit did not keep the value (rejected by the unit, or Save did not complete)");
+                    // the previous option was saved and fetched: find the row again
+                    var (_, again) = LocateRow(window, search, p, refresh: true);
+                    if (again == null)
+                    {
+                        Fail(p, "3 set the new value", "the parameter was not found again before trying option " + (i + 1), "check the Configure screen");
+                        ok = false;
+                        break;
+                    }
+
+                    valueEl = again;
                 }
 
-                ok &= changed;
-                changedValueUsed = changed ? newValue : null;
+                ok = ChangeAndVerify(window, search, p, valueEl, before, plan[i].value, plan[i].why);
+                before = plan[i].value;
             }
         }
         catch (Exception ex)
         {
-            Fail(p, "4-6 change the parameter", "exception: " + ex.Message, "see the message");
+            Fail(p, "3-5 change the parameter", "exception: " + ex.Message, "see the message");
             ok = false;
         }
 
@@ -483,15 +462,68 @@ public class ConfigureRandomChangeTest
             }
         }
 
-        _log("STEP  | 7 restore the Excel default '" + p.Default + "' and verify it");
+        _log("STEP  | 6 restore the Excel default '" + p.Default + "' and verify it");
         bool restored = RestoreDefault(window, search, p);
         _lastRestored = restored;
-        if (ok && restored && changedValueUsed != null)
+        return ok && restored ? Outcome.Passed : Outcome.Failed;
+    }
+
+    // One change: set `newValue`, Save, Fetch and verify that the unit returns it. False = failed (reason already logged with Fail).
+    private bool ChangeAndVerify(Window window, TextBox search, Param p, AutomationElement valueEl, string before, string newValue, string why)
+    {
+        SetValue(window, valueEl, newValue);
+        string shownNow = ReadParam(window, p, out _);
+        _log("SET   | " + p.Label + " | '" + before + "' -> '" + newValue + "' | the GUI now shows '" + shownNow + "' | " + why
+             + " | Save to Unit Flash is " + (FindByHelp(window, "Save to Unit Flash")?.IsEnabled == true ? "enabled" : "DISABLED"));
+        if (!SameValue(shownNow, newValue))
         {
-            MarkTested(state, p, type, changedValueUsed);      // only now - change verified AND default restored+verified
+            Fail(p, "3 set the new value", "after setting '" + newValue + "' the control shows '" + shownNow + "'",
+                 "the value was rejected/not committed (range, focus) - look at the Configure screen");
+            return false;
         }
 
-        return ok && restored ? Outcome.Passed : Outcome.Failed;
+        if (!WaitSaveEnabled(window) && valueEl.ControlType == ControlType.Edit)
+        {
+            // the edit may not have been committed: click into the field again and press Enter once more
+            _log("NOTE  | " + p.Label + " | Save to Unit Flash is still disabled - pressing Enter in the field again");
+            try
+            {
+                valueEl.Focus();
+            }
+            catch (Exception ex) when (ex is InvalidOperationException or System.Runtime.InteropServices.COMException)
+            {
+                // focus not possible right now
+            }
+
+            Keyboard.Type(VirtualKeyShort.ENTER);
+            Thread.Sleep(500);
+        }
+
+        if (!WaitSaveEnabled(window))
+        {
+            Fail(p, "3 set the new value", "the value shows '" + shownNow + "' but 'Save to Unit Flash' stayed DISABLED - the GUI did not register a pending change",
+                 "the edit was probably not committed (needs Enter/focus change?) or equals the stored value");
+            return false;
+        }
+
+        _log("STEP  | 4 Save to Unit Flash" + (DoReset ? ", Reset Unit" : "") + ", Fetch Parameters");
+        if (!SaveResetFetch(window, search, p))
+        {
+            return false;
+        }
+
+        _log("STEP  | 5 verify the value after Save / Fetch");
+        var (_, v2) = LocateRow(window, search, p, refresh: true);
+        string after = v2 == null ? "<NOT FOUND>" : ReadParam(window, p, out _);
+        bool changed = SameValue(after, newValue);
+        _log((changed ? "PASS  | " : "FAIL  | ") + p.Label + " | after Save/Fetch: expected='" + newValue + "' actual='" + after + "'");
+        if (!changed)
+        {
+            Fail(p, "5 verify after Save/Fetch", "expected '" + newValue + "' but the unit returned '" + after + "' after fetching",
+                 "the unit did not keep the value (rejected by the unit, or Save did not complete)");
+        }
+
+        return changed;
     }
 
     private bool WaitSaveEnabled(Window window)
@@ -515,10 +547,10 @@ public class ConfigureRandomChangeTest
     {
         try
         {
-            var (_, v) = Locate(window, search, p, clearFirst: true);
+            var (_, v) = LocateRow(window, search, p, refresh: true);
             if (v == null)
             {
-                Fail(p, "7 restore default", "cannot restore the default: the parameter was not found again", "check the Configure screen manually");
+                Fail(p, "6 restore default", "cannot restore the default: the parameter was not found again", "check the Configure screen manually");
                 return false;
             }
 
@@ -526,7 +558,7 @@ public class ConfigureRandomChangeTest
             v = freshV ?? v;
             if (now.Length == 0)
             {
-                Fail(p, "7 restore default", "cannot read the current value to compare with the default", "check the parameter on the unit manually");
+                Fail(p, "6 restore default", "cannot read the current value to compare with the default", "check the parameter on the unit manually");
                 return false;
             }
 
@@ -543,27 +575,27 @@ public class ConfigureRandomChangeTest
                 return false;
             }
 
-            var (_, v2) = Locate(window, search, p, clearFirst: true);
+            var (_, v2) = LocateRow(window, search, p, refresh: true);
             string after = v2 == null ? "<NOT FOUND>" : ReadParam(window, p, out _);
             bool isDefault = SameValue(after, p.Default);
             _log((isDefault ? "PASS  | " : "FAIL  | ") + p.Label + " | back to default: expected='" + p.Default + "' actual='" + after + "'");
             if (!isDefault)
             {
-                Fail(p, "7 restore default", "after restoring, the value is '" + after + "' instead of the default '" + p.Default + "'", "the unit still holds a changed value - fix it manually");
+                Fail(p, "6 restore default", "after restoring, the value is '" + after + "' instead of the default '" + p.Default + "'", "the unit still holds a changed value - fix it manually");
             }
 
             return isDefault;
         }
         catch (Exception ex)
         {
-            Fail(p, "7 restore default", "exception: " + ex.Message, "check the parameter on the unit manually");
+            Fail(p, "6 restore default", "exception: " + ex.Message, "check the parameter on the unit manually");
             return false;
         }
     }
 
     // ------------------------------------------------------------------ value choice
 
-    private string? ChooseNewValue(AutomationElement valueEl, Param p, string current, Tip tip, Dictionary<string, State> state, out string why)
+    private string? ChooseNewValue(AutomationElement valueEl, Param p, string current, Tip tip, out string why)
     {
         why = "";
         if (Normalize(current).Length == 0)
@@ -572,39 +604,12 @@ public class ConfigureRandomChangeTest
             return null;
         }
 
-        state.TryGetValue(p.Key, out var st);
-        var tried = (st?.Tried ?? "").Split('|', StringSplitOptions.RemoveEmptyEntries).ToHashSet(StringComparer.OrdinalIgnoreCase);
-
-        if (valueEl.ControlType == ControlType.CheckBox)
-        {
-            var toggle = valueEl.Patterns.Toggle.PatternOrDefault;
-            string next = toggle?.ToggleState.ValueOrDefault == ToggleState.On ? "Off" : "On";
-            why = "check box -> opposite state";
-            return next;
-        }
-
-        if (valueEl.ControlType == ControlType.ComboBox)
-        {
-            var options = ReadOptions(valueEl);
-            if (options.Count < 2)
-            {
-                why = "choice parameter with fewer than 2 options";
-                return null;
-            }
-
-            string cur = Normalize(current);
-            var others = options.Where(o => !SameValue(o, cur)).ToList();
-            var fresh = others.Where(o => !tried.Contains(Normalize(o))).ToList();
-            var pool = fresh.Count > 0 ? fresh : others;
-            string pick = pool[_random.Next(pool.Count)];
-            why = "option " + (fresh.Count > 0 ? "not tried before" : "(all options tried before - any other)") + " | options=" + string.Join(", ", options)
-                  + " | tried=" + (tried.Count == 0 ? "-" : string.Join(", ", tried));
-            return pick;
-        }
-
         // Edit / text box
         string cleaned = Normalize(current);
-        bool isString = tip.TypeToken.Equals("String", StringComparison.OrdinalIgnoreCase) || (!double.TryParse(cleaned, NumberStyles.Float, CultureInfo.InvariantCulture, out _) && !tip.Min.HasValue);
+        // A text value is a string whether or not the tooltip has Min/Max (for a string they are the allowed LENGTH) and whether or not the
+        // data-type label ("String") could be read from the row.
+        bool isString = tip.TypeToken.Equals("String", StringComparison.OrdinalIgnoreCase)
+                        || !double.TryParse(cleaned, NumberStyles.Float, CultureInfo.InvariantCulture, out _);
         if (isString)
         {
             int min = (int)(tip.Min ?? 1), max = (int)(tip.Max ?? 12);
@@ -661,6 +666,31 @@ public class ConfigureRandomChangeTest
             return null;
         }
 
+        // Some constraints depend on OTHER parameters: "This value must be lower then Vin2 High Threshold P1/P2/P3" (or "higher"). The GUI rejects
+        // a value that breaks it (Save stays disabled), and the other parameters are sitting at their own (valid) values - so only move in the
+        // allowed direction: "lower" = between Min and the current value, "higher" = between the current value and Max.
+        string direction = "";
+        var dep = Regex.Match(tip.Text ?? "", @"must be\s+(lower|less|smaller|higher|greater|bigger)", RegexOptions.IgnoreCase);
+        if (dep.Success)
+        {
+            bool lower = dep.Groups[1].Value.ToLowerInvariant() is "lower" or "less" or "smaller";
+            if (lower)
+            {
+                hi = Math.Min(hi, cur0);
+            }
+            else
+            {
+                lo = Math.Max(lo, cur0);
+            }
+
+            direction = " | the constraint says 'must be " + dep.Groups[1].Value.ToLowerInvariant() + " than ...' (another parameter), so only " + (lower ? "below" : "above") + " the current value";
+            if (hi - lo < 1e-9)
+            {
+                why = "the value cannot move " + (lower ? "below" : "above") + " the current value inside " + Fmt(tip.Min) + ".." + Fmt(tip.Max) + " (constraint depends on another parameter)";
+                return null;
+            }
+        }
+
         int decimals = cleaned.Contains('.') ? cleaned.Length - cleaned.IndexOf('.') - 1 : 0;
         double step = decimals == 0 ? 1 : Math.Pow(10, -decimals);
         double value = cur0;
@@ -677,7 +707,7 @@ public class ConfigureRandomChangeTest
             return null;
         }
 
-        why = "random value inside the tooltip range " + Fmt(lo) + ".." + Fmt(hi);
+        why = "random value inside " + Fmt(lo) + ".." + Fmt(hi) + direction;
         return value.ToString("F" + decimals, CultureInfo.InvariantCulture);
     }
 
@@ -1074,28 +1104,61 @@ public class ConfigureRandomChangeTest
                 {
                     return value;
                 }
+
+                // A text editor exposes an EMPTY value to UIA; the user reads the value from a separate text of the same row. Use it right
+                // away (waiting for retries does not help and costs ~10 s per read).
+                if (el.ControlType == ControlType.Edit)
+                {
+                    string shown = DisplayedValue(window, p, el);
+                    if (shown.Length > 0)
+                    {
+                        return shown;
+                    }
+                }
             }
 
             Thread.Sleep(RetryDelayMs);
         }
 
-        // A logic-expression editor is an EMPTY text box by design; the user reads the expression from a separate Text in the row.
-        var nameEl = window.FindFirstDescendant(cf => cf.ByAutomationId(p.NameId));
-        if (nameEl != null && element != null)
+        return "";
+    }
+
+    // the row also shows the parameter's data type as a plain text ("String") - that is a label, not the value
+    private static readonly HashSet<string> DataTypeTokens = new(StringComparer.OrdinalIgnoreCase) { "String", "Integer", "Float", "Number", "Boolean" };
+
+    // The visible text of the row that is the value: not the parameter name, not the data-type label, not a [unit], not a counter.
+    private static string DisplayedValue(Window window, Param p, AutomationElement valueEl)
+    {
+        try
         {
-            string paramName = (nameEl.Name ?? "").Trim();
-            var row = element.Parent;
-            string displayed = row == null ? "" : Walk(row).Where(t => t.ControlType == ControlType.Text && !t.Properties.IsOffscreen.ValueOrDefault)
-                .Select(t => (t.Name ?? "").Trim())
-                .FirstOrDefault(t => t.Length > 0 && t.Length < 80 && t != paramName && !t.StartsWith("[") && !Regex.IsMatch(t, @"^\d+ / \d+$")) ?? "";
-            if (displayed.Length > 0)
+            string paramName = (window.FindFirstDescendant(cf => cf.ByAutomationId(p.NameId))?.Name ?? p.Name).Trim();
+            var row = valueEl.Parent;
+            return row == null ? "" : VisibleTexts(row, 0)
+                .FirstOrDefault(t => t.Length > 0 && t.Length < 80 && t != paramName && !DataTypeTokens.Contains(t) && !t.StartsWith("[") && !Regex.IsMatch(t, @"^\d+ / \d+$")) ?? "";
+        }
+        catch
+        {
+            return "";
+        }
+    }
+
+    private static IEnumerable<string> VisibleTexts(AutomationElement root, int depth)
+    {
+        foreach (var c in Kids(root))
+        {
+            if (c.ControlType == ControlType.Text && !c.Properties.IsOffscreen.ValueOrDefault && c.BoundingRectangle.Width > 0)
             {
-                _log("NOTE  | " + p.Label + " | the value control is an empty editor - using the text DISPLAYED in the row: '" + displayed + "'");
-                return displayed;
+                yield return (c.Name ?? "").Trim();
+            }
+
+            if (depth < 4)
+            {
+                foreach (var t in VisibleTexts(c, depth + 1))
+                {
+                    yield return t;
+                }
             }
         }
-
-        return "";
     }
 
     // The parameter row has its own small refresh button (tooltip "Refresh parameter value from unit") next to the value.
@@ -1203,6 +1266,8 @@ public class ConfigureRandomChangeTest
         TextCopy.ClipboardService.SetText(newValue);
         Keyboard.TypeSimultaneously(VirtualKeyShort.CONTROL, VirtualKeyShort.KEY_V);
         Thread.Sleep(200);
+        Keyboard.Type(VirtualKeyShort.ENTER);       // commit the edit like a user does (Enter), then leave the field
+        Thread.Sleep(300);
         Keyboard.Type(VirtualKeyShort.TAB);
         Thread.Sleep(500);
     }
@@ -1370,7 +1435,7 @@ public class ConfigureRandomChangeTest
 
         if (button == null)
         {
-            Fail(p, "5 " + label, "the '" + label + "' button (" + helpText + ") did not become available/enabled within " + timeoutMs / 1000 + " s",
+            Fail(p, "4 " + label, "the '" + label + "' button (" + helpText + ") did not become available/enabled within " + timeoutMs / 1000 + " s",
                  label == "Save" ? "Save is disabled while no change is pending - the previous step probably did not register the edit"
                  : label == "Reset" ? "the unit/GUI may be busy or disconnected"
                  : "the unit may still be restarting after Reset (reconnect time)");
@@ -1403,7 +1468,7 @@ public class ConfigureRandomChangeTest
 
                 if (HasPasswordDialog(window))
                 {
-                    Fail(p, "5 " + label, "the app asks for the configuration-mode password", "the password is not automated - enter configuration mode manually first");
+                    Fail(p, "4 " + label, "the app asks for the configuration-mode password", "the password is not automated - enter configuration mode manually first");
                     return false;
                 }
 
@@ -1416,7 +1481,7 @@ public class ConfigureRandomChangeTest
         Thread.Sleep(2000);
         if (HasPasswordDialog(window))
         {
-            Fail(p, "5 " + label, "the app asks for the configuration-mode password", "the password is not automated - enter configuration mode manually first");
+            Fail(p, "4 " + label, "the app asks for the configuration-mode password", "the password is not automated - enter configuration mode manually first");
             return false;
         }
 
@@ -1498,7 +1563,7 @@ public class ConfigureRandomChangeTest
         }
     }
 
-    // ------------------------------------------------------------------ Excel: parameters + tested state
+    // ------------------------------------------------------------------ Excel: parameters
 
     private List<Param> ReadParams()
     {
@@ -1556,122 +1621,5 @@ public class ConfigureRandomChangeTest
         string temp = Path.Combine(Path.GetTempPath(), "ConfigRandom_" + Guid.NewGuid().ToString("N") + ".xlsx");
         File.Copy(_excelPath, temp, true);       // works even while the workbook is open in Excel
         return temp;
-    }
-
-    // Tested-state lives in its OWN workbook next to the project (never in the master): one sheet "<PN> Tested", one row per
-    // parameter that was ever tested. A parameter is drawn only if it is not listed for the CURRENT GUI version.
-    private string StatePath => Path.Combine(Path.GetDirectoryName(_excelPath)!, "PowerGUIAutomation", "ConfigureRandomChange_Tested.xlsx");
-    private string StateSheet => _unit.PartNumber + " Tested";
-    private static readonly string[] StateCols = { "Key", "Channel", "Parameter Name", "Control Type", "Tested GUI Version", "Tested Date", "Tried Values/Options" };
-
-    private Dictionary<string, State> LoadState(List<Param> all)
-    {
-        var state = new Dictionary<string, State>();
-        if (!File.Exists(StatePath))
-        {
-            return state;
-        }
-
-        string temp = Path.Combine(Path.GetTempPath(), "ConfigRandomState_" + Guid.NewGuid().ToString("N") + ".xlsx");
-        File.Copy(StatePath, temp, true);
-        try
-        {
-            using var wb = new XLWorkbook(temp);
-            if (wb.Worksheets.Contains(StateSheet))
-            {
-                foreach (var row in wb.Worksheet(StateSheet).RowsUsed().Skip(1))
-                {
-                    string key = row.Cell(1).GetString().Trim();
-                    if (key.Length > 0)
-                    {
-                        state[key] = new State { Type = row.Cell(4).GetString().Trim(), Version = row.Cell(5).GetString().Trim(), Date = row.Cell(6).GetString().Trim(), Tried = row.Cell(7).GetString().Trim() };
-                    }
-                }
-            }
-        }
-        finally
-        {
-            try { File.Delete(temp); } catch { /* temp copy */ }
-        }
-
-        foreach (var p in all.Where(x => state.TryGetValue(x.Key, out var s) && s.Type.Length > 0))
-        {
-            p.KnownType = state[p.Key].Type;
-        }
-
-        return state;
-    }
-
-    private bool IsTestedNow(Dictionary<string, State> state, Param p) => state.TryGetValue(p.Key, out var s) && s.Version == _guiVersion;
-
-    private void RememberType(Dictionary<string, State> state, Param p, string type)
-    {
-        state.TryGetValue(p.Key, out var s);
-        state[p.Key] = new State { Version = s?.Version ?? "", Date = s?.Date ?? "", Tried = s?.Tried ?? "", Type = type };
-        if (!_dryRun)
-        {
-            SaveState(state, p);      // a dry run never writes to the workbook
-        }
-    }
-
-    private void MarkTested(Dictionary<string, State> state, Param p, string type, string valueUsed)
-    {
-        state.TryGetValue(p.Key, out var old);
-        var tried = (old?.Tried ?? "").Split('|', StringSplitOptions.RemoveEmptyEntries).ToList();
-        if (!tried.Contains(valueUsed, StringComparer.OrdinalIgnoreCase))
-        {
-            tried.Add(valueUsed);
-        }
-
-        state[p.Key] = new State { Version = _guiVersion, Date = DateTime.Now.ToString("yyyy-MM-dd HH:mm"), Tried = string.Join("|", tried), Type = type };
-        SaveState(state, p);
-        _log("MARK  | " + p.Label + " | tested on GUI version " + _guiVersion);
-    }
-
-    // Persist after every parameter, so an aborted run keeps its results. Whole sheet is rewritten from memory.
-    private void SaveState(Dictionary<string, State> state, Param justChanged)
-    {
-        for (int attempt = 1; attempt <= 3; attempt++)
-        {
-            try
-            {
-                using var wb = File.Exists(StatePath) ? new XLWorkbook(StatePath) : new XLWorkbook();   // IOException if Excel has it open
-                var ws = wb.Worksheets.Contains(StateSheet) ? wb.Worksheet(StateSheet) : wb.AddWorksheet(StateSheet);
-                ws.Clear();
-                for (int c = 0; c < StateCols.Length; c++)
-                {
-                    ws.Cell(1, c + 1).Value = StateCols[c];
-                    ws.Cell(1, c + 1).Style.Font.Bold = true;
-                }
-
-                int r = 2;
-                foreach (var kv in state.Where(k => k.Key.StartsWith(_unit.ParameterSheet + "|")).OrderBy(k => k.Key, StringComparer.Ordinal))
-                {
-                    var parts = kv.Key.Split('|');
-                    ws.Cell(r, 1).Value = kv.Key;
-                    ws.Cell(r, 2).Value = parts.Length > 1 ? parts[1] : "";
-                    ws.Cell(r, 3).Value = parts.Length > 2 ? parts[2] : "";
-                    ws.Cell(r, 4).Value = kv.Value.Type;
-                    ws.Cell(r, 5).Value = kv.Value.Version;
-                    ws.Cell(r, 6).Value = kv.Value.Date;
-                    ws.Cell(r, 7).Value = kv.Value.Tried;
-                    r++;
-                }
-
-                ws.Columns().AdjustToContents();
-                wb.SaveAs(StatePath);
-                return;
-            }
-            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-            {
-                if (attempt == 3)
-                {
-                    _log("WARN  | tested-state file is open/locked (" + StatePath + ") - NOT saved; close it in Excel. This result will be lost if the run stops.");
-                    return;
-                }
-
-                Thread.Sleep(1500);
-            }
-        }
     }
 }

@@ -22,7 +22,7 @@ namespace PowerGUIAutomation.Tests;
 // channel's value.
 //
 // Stops on the first mismatch, same as every other test in this project.
-public class ConfigureParametersTest
+public class ConfigureCompareParametersToExcelTest
 {
     private const int MaxFindRetries = 12;
     private const int RetryDelayMs = 250;
@@ -47,7 +47,7 @@ public class ConfigureParametersTest
 
     private sealed record Row(string ExcelRow, string ParameterPath, string ExpectedName, string ValuePath, string ExpectedValue, int Channel);
 
-    public ConfigureParametersTest(string excelPath, Action<string> log, string[]? sheetNames = null, UnitProfile? unit = null, Func<int, string, bool>? rowFilter = null)
+    public ConfigureCompareParametersToExcelTest(string excelPath, Action<string> log, string[]? sheetNames = null, UnitProfile? unit = null, Func<int, string, bool>? rowFilter = null)
     {
         _rowFilter = rowFilter;
         _excelPath = excelPath;

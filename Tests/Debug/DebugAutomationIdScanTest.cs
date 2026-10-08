@@ -17,7 +17,7 @@ namespace PowerGUIAutomation.Tests;
 //
 // Status per parameter: OK / NAME-ID MISSING / NAME-ID DIFFERENT / VALUE-ID MISSING / VALUE-ID DIFFERENT / VALUE-ID SHARED /
 // NOT FOUND (the row never appeared in the search results).
-public class ConfigureIdScanTest
+public class DebugAutomationIdScanTest
 {
     private const int FindRetries = 10;
     private const int RetryDelayMs = 350;
@@ -54,7 +54,7 @@ public class ConfigureIdScanTest
         public int ValueIdCount;
     }
 
-    public ConfigureIdScanTest(string excelPath, Action<string> log, UnitProfile unit)
+    public DebugAutomationIdScanTest(string excelPath, Action<string> log, UnitProfile unit)
     {
         _excelPath = excelPath;
         _log = log;
@@ -343,7 +343,7 @@ public class ConfigureIdScanTest
 
     private string WriteReport(List<Result> results)
     {
-        string dir = Path.Combine(Path.GetDirectoryName(_excelPath)!, "Excel");
+        string dir = Path.Combine(Path.GetDirectoryName(Path.GetDirectoryName(_excelPath)!)!, "Excel");
         Directory.CreateDirectory(dir);
         string path = Path.Combine(dir, "Configure_AutomationId_Scan_" + _unit.PartNumber + "_" + DateTime.Now.ToString("yyyyMMdd_HHmmss") + ".xlsx");
 
@@ -402,7 +402,7 @@ public class ConfigureIdScanTest
         return path;
     }
 
-    // ------------------------------------------------------------------ UI helpers (same behaviour as ConfigureRandomChangeTest)
+    // ------------------------------------------------------------------ UI helpers (same behaviour as ConfigureChangeAndRestoreAllParametersTest)
 
     private static TextBox? FreshSearch(Window window) => window.FindFirstDescendant(cf => cf.ByAutomationId("searchTextBox"))?.AsTextBox();
 

@@ -6,13 +6,19 @@ using PowerGUIAutomation.Tests;
 // All test data lives in one Excel workbook - every test class reads its own
 // sheet from this same file, so the whole project is driven by the Excel as
 // the source of truth.
-const string ExcelPath = @"C:\Users\User\OneDrive - Redler Technologies\QA\Power\scripts\Power GUI AU-Tests Master.xlsx";
+const string ExcelPath = @"C:\Users\User\OneDrive - Redler Technologies\QA\Power\scripts\PowerGUIAutomation\Power GUI AU-Tests Master.xlsx";
 
 string logPath = Path.Combine(AppContext.BaseDirectory, "GUIAutomationLog_" + DateTime.Now.ToString("yyyyMMdd_HHmmss") + ".txt");
 
 void Log(string line)
 {
     string stamped = DateTime.Now.ToString("HH:mm:ss.fff") + "  " + line;
+    if (line.StartsWith("DRAW", StringComparison.Ordinal))
+    {
+        // the log file gets the same separator between two parameters as the console
+        File.AppendAllText(logPath, Environment.NewLine + new string('-', 100) + Environment.NewLine, new System.Text.UTF8Encoding(true));
+    }
+
     File.AppendAllText(logPath, stamped + Environment.NewLine, new System.Text.UTF8Encoding(true));   // the file keeps the plain one-line-per-event text
     PrintColored(stamped, line);
 }
@@ -43,10 +49,10 @@ void PrintColored(string stamped, string line)
         case "DRAW":
             Console.WriteLine();
             Write(new string('-', 100), ConsoleColor.DarkGray);
-            Write(time + "  >>> " + rest, ConsoleColor.Black, ConsoleColor.Cyan);
+            Write(time + "  >>> " + rest, ConsoleColor.Cyan);
             return;
         case "STEP":
-            Write(time + "     [step] " + rest, ConsoleColor.Cyan);
+            Write(time + "     [step] " + rest, ConsoleColor.DarkGray);
             return;
         case "FAIL" when rest.Contains(" | STEP: "):
         {
@@ -54,10 +60,10 @@ void PrintColored(string stamped, string line)
             string Part(string key) => parts.FirstOrDefault(x => x.StartsWith(key))?.Substring(key.Length).Trim() ?? "";
             string who = parts[0];
             Write(time + "  " + new string('!', 94), ConsoleColor.Red);
-            Write(time + "  FAILED   " + who, ConsoleColor.White, ConsoleColor.DarkRed);
-            Write(time + "    step  : " + Part("STEP:"), ConsoleColor.Yellow);
+            Write(time + "  FAILED   " + who, ConsoleColor.Red);
+            Write(time + "    step  : " + Part("STEP:"), ConsoleColor.Red);
             Write(time + "    why   : " + Part("WHY:"), ConsoleColor.Red);
-            Write(time + "    check : " + Part("CHECK:"), ConsoleColor.DarkYellow);
+            Write(time + "    check : " + Part("CHECK:"), ConsoleColor.Red);
             Write(time + "  " + new string('!', 94), ConsoleColor.Red);
             return;
         }
@@ -68,34 +74,29 @@ void PrintColored(string stamped, string line)
             }
             else if (rest.StartsWith("FAILED"))
             {
-                Write(time + "  " + rest + " ", ConsoleColor.White, ConsoleColor.DarkRed);
+                Write(time + "  " + rest, ConsoleColor.Red);
             }
             else if (rest.StartsWith("PASSED"))
             {
-                Write(time + "  " + rest + " ", ConsoleColor.Black, ConsoleColor.Green);
+                Write(time + "  " + rest, ConsoleColor.Green);
             }
             else
             {
-                Write(time + "  " + rest, ConsoleColor.Yellow);
+                Write(time + "  " + rest, ConsoleColor.Gray);
             }
 
             return;
     }
 
+    // Few colors on purpose: green = pass, red = fail, yellow = warning/skip/note, cyan = the parameter that is being checked,
+    // dark gray = the step headers and the GUI's own log lines, everything else the normal gray.
     ConsoleColor color = tag switch
     {
         "PASS" or "MARK" => ConsoleColor.Green,
         "FAIL" or "STOPPED" => ConsoleColor.Red,
-        "WARN" => ConsoleColor.Yellow,
-        "INFO" => ConsoleColor.Gray,
-        "READ" => ConsoleColor.White,
-        "CHANGE" or "SET" or "RESTORE" => ConsoleColor.Yellow,
-        "CLICK" => ConsoleColor.Blue,
+        "WARN" or "SKIP" or "NOTE" => ConsoleColor.Yellow,
         "APPLOG" => ConsoleColor.DarkGray,
-        "SKIP" or "NOTE" => ConsoleColor.DarkYellow,
-        "DRY" => ConsoleColor.DarkCyan,
-        "START" or "DONE" => ConsoleColor.Magenta,
-        _ => line.StartsWith("===") ? (line.Contains("PASSED") ? ConsoleColor.Green : ConsoleColor.Red) : ConsoleColor.DarkGray,
+        _ => line.StartsWith("===") ? (line.Contains("PASSED") ? ConsoleColor.Green : ConsoleColor.Red) : ConsoleColor.Gray,
     };
     Write(stamped, color);
 }
@@ -110,9 +111,8 @@ void ShowTestBanner(string? choice, UnitProfile? bannerUnit)
     {
         "1" => "OPERATE - SECOND BAR (UNIT INFO BAR) COMPARISON",
         "2" => "CONFIGURE - PARAMETERS COMPARISON",
-        "3" => "CONFIGURE - RANDOM PARAMETER CHANGE TEST",
-        "4" => "CONFIGURE - AUTOMATIONID SCAN (READ-ONLY)",
-        "5" => "DEBUG - CONFIGURE COMPARISON ON CHOSEN CHANNELS / PARAMETERS",
+        "3" => "CONFIGURE - CHANGE AND RESTORE EVERY PARAMETER",
+        "5" => "DEBUG TESTS (READ-ONLY)",
         _ => null,
     };
     if (title == null)
@@ -268,9 +268,8 @@ while (true)
         Console.WriteLine("=== Power GUI Automation === | Unit: " + (unit?.Name ?? "(none selected)"));
         Console.WriteLine("1. Operate - Second Bar (unit info bar) comparison");
         Console.WriteLine("2. Configure - Parameters comparison");
-        Console.WriteLine("3. Configure - Random parameter change test ");
-        Console.WriteLine("4. Configure - AutomationId scan of all parameters (read-only, report to Excel)");
-        Console.WriteLine("5. Debug - Configure comparison on chosen channels / parameters only (read-only)");
+        Console.WriteLine("3. Configure - Change and restore every parameter (writes to the unit)");
+        Console.WriteLine("5. Debug tests (read-only): Configure comparison on chosen channels / parameters, AutomationId scan");
         Console.WriteLine("U. Change the unit under test");
         Console.WriteLine("0. Exit");
         Console.Write("Choice: ");
@@ -304,7 +303,7 @@ while (true)
             }
             catch (Exception ex)
             {
-                Log("FAIL | Unhandled error: " + ex.Message);
+                Log("FAIL | Unhandled error (" + ex.GetType().Name + "): " + ex.Message + " | at " + ex.StackTrace?.Split(Environment.NewLine).FirstOrDefault()?.Trim());
             }
             break;
         case "2":
@@ -312,13 +311,13 @@ while (true)
             {
                 if (unit == null) { Log("FAIL | no unit selected - choose the unit (part number) first: press U, or pass unit=RD152"); break; }
                 if (!MasterOk() || !UnitResetConfirmed(!nonInteractive)) { break; }
-                var configureTest = new ConfigureParametersTest(ExcelPath, Log, new[] { unit.ParameterSheet }, unit);
+                var configureTest = new ConfigureCompareParametersToExcelTest(ExcelPath, Log, new[] { unit.ParameterSheet }, unit);
                 bool configurePassed = configureTest.Run();
                 Log(configurePassed ? "=== TEST PASSED ===" : "=== TEST FAILED ===");
             }
             catch (Exception ex)
             {
-                Log("FAIL | Unhandled error: " + ex.Message);
+                Log("FAIL | Unhandled error (" + ex.GetType().Name + "): " + ex.Message + " | at " + ex.StackTrace?.Split(Environment.NewLine).FirstOrDefault()?.Trim());
             }
             break;
         case "3":
@@ -326,23 +325,9 @@ while (true)
             {
                 if (unit == null) { Log("FAIL | no unit selected - choose the unit (part number) first: press U, or pass unit=RD152"); break; }
                 if (!MasterOk() || !UnitResetConfirmed(!nonInteractive)) { break; }
-                var randomChangeTest = new ConfigureRandomChangeTest(ExcelPath, Log, unit);
+                var randomChangeTest = new ConfigureChangeAndRestoreAllParametersTest(ExcelPath, Log, unit);
                 bool randomChangePassed = randomChangeTest.Run();
                 Log(randomChangePassed ? "=== TEST PASSED ===" : "=== TEST FAILED ===");
-            }
-            catch (Exception ex)
-            {
-                Log("FAIL | Unhandled error (" + ex.GetType().Name + "): " + ex.Message + " | at " + ex.StackTrace?.Split(Environment.NewLine).FirstOrDefault()?.Trim());
-            }
-            break;
-        case "4":
-            try
-            {
-                if (unit == null) { Log("FAIL | no unit selected - choose the unit (part number) first: press U, or pass unit=RD152"); break; }
-                if (!MasterOk()) { break; }
-                var scanTest = new ConfigureIdScanTest(ExcelPath, Log, unit);
-                bool scanPassed = scanTest.Run();
-                Log(scanPassed ? "=== TEST PASSED ===" : "=== TEST FAILED ===");
             }
             catch (Exception ex)
             {
@@ -354,7 +339,7 @@ while (true)
             {
                 if (unit == null) { Log("FAIL | no unit selected - choose the unit (part number) first: press U, or pass unit=RD152"); break; }
                 if (!MasterOk()) { break; }
-                var debugTest = new ConfigureDebugTest(ExcelPath, Log, unit);
+                var debugTest = new DebugTests(ExcelPath, Log, unit);
                 bool debugPassed = debugTest.Run();
                 Log(debugPassed ? "=== TEST PASSED ===" : "=== TEST FAILED ===");
             }

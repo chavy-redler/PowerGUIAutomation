@@ -2,16 +2,16 @@ using PowerGUIAutomation;
 
 namespace PowerGUIAutomation.Tests;
 
-// General-purpose DEBUG test: runs the Configure comparison (ConfigureParametersTest, read-only) on a chosen SUBSET of the
-// unit's Excel rows - e.g. only channel 15, or channels 13 and 15, or one parameter name - so a suspicion can be checked in
-// minutes instead of a full run. Change what it runs by answering the questions (nothing is hard-coded here).
-public class ConfigureDebugTest
+// DEBUG test (read-only): runs the "Configure compare parameters to Excel" test on a chosen SUBSET of the unit's Excel rows - e.g. only
+// channel 15, or channels 13 and 15, or one parameter name - so a suspicion can be checked in minutes instead of a full run.
+// Which rows run is decided by the questions it asks (nothing is hard-coded here).
+public class DebugCompareSubsetTest
 {
     private readonly string _excelPath;
     private readonly Action<string> _log;
     private readonly UnitProfile _unit;
 
-    public ConfigureDebugTest(string excelPath, Action<string> log, UnitProfile unit)
+    public DebugCompareSubsetTest(string excelPath, Action<string> log, UnitProfile unit)
     {
         _excelPath = excelPath;
         _log = log;
@@ -52,7 +52,7 @@ public class ConfigureDebugTest
         _log("START | Debug run | unit=" + _unit.Name + " | channels=" + (channels == null ? "all" : string.Join(",", channels.OrderBy(x => x).Select(x => x == 0 ? "System" : x.ToString())))
              + " | name contains='" + nameText + "'");
 
-        var test = new ConfigureParametersTest(_excelPath, _log, new[] { _unit.ParameterSheet }, _unit,
+        var test = new ConfigureCompareParametersToExcelTest(_excelPath, _log, new[] { _unit.ParameterSheet }, _unit,
             (channel, name) => (channels == null || channels.Contains(channel))
                                && (nameText.Length == 0 || name.Contains(nameText, StringComparison.OrdinalIgnoreCase)));
         return test.Run();
