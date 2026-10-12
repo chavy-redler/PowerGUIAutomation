@@ -33,27 +33,21 @@ public class ConfigureCompareParametersToExcelTest
     private readonly UnitProfile? _unit;
     private readonly Func<int, string, bool>? _rowFilter;     // debug runs: (channel, parameter name) -> run this row?
     private static readonly Regex BracketedRegex = new(@"^\[\s*([^,\]]+?)\s*[,\]]");
-    private static readonly Regex FetchingRegex = new(@"Fetching parameters\.\.\.\s*(\d+)\s*/\s*(\d+)", RegexOptions.Compiled);
 
     // the row also shows the parameter's data type as a plain text ("String") - that is a label, not the value
     private static readonly HashSet<string> DataTypeTokens = new(StringComparer.OrdinalIgnoreCase) { "String", "Integer", "Float", "Number", "Boolean" };
 
     private int _pass, _fail, _skip;
 
-    // "Channel N Group Control" rows are listed on their own tree page "Group Channel Control" (all channels together), not under the channel
-    private static readonly Regex GroupRowRegex = new(@"^Channel \d+ Group Control$", RegexOptions.Compiled);
-    private const int GroupScope = -1;
-    private static bool IsGroupRow(Row r) => r.Channel > 0 && GroupRowRegex.IsMatch(r.ExpectedName);
+    private sealed record Row(string ExcelRow, string NameId, string ExpectedName, string ValueId, string ExpectedValue, int Channel);
 
-    private sealed record Row(string ExcelRow, string ParameterPath, string ExpectedName, string ValuePath, string ExpectedValue, int Channel);
-
-    public ConfigureCompareParametersToExcelTest(string excelPath, Action<string> log, string[]? sheetNames = null, UnitProfile? unit = null, Func<int, string, bool>? rowFilter = null)
+    public ConfigureCompareParametersToExcelTest(string excelPath, Action<string> log, string[] sheetNames, UnitProfile? unit = null, Func<int, string, bool>? rowFilter = null)
     {
         _rowFilter = rowFilter;
         _excelPath = excelPath;
         _log = log;
         _unit = unit;
-        _sheetNames = sheetNames ?? new[] { "System Parameters", "Channel Parameters" };
+        _sheetNames = sheetNames;
     }
 
     public bool Run()
@@ -95,32 +89,32 @@ public class ConfigureCompareParametersToExcelTest
             }
         }
 
-        if (!WaitFetchDone(mainWindow, 300000))
+        if (!ConfigureNav.WaitFetchDone(mainWindow, 300000, _log))
         {
             _log("FAIL  | (test setup) | STEP: open the Configure tab | WHY: the GUI kept 'Fetching parameters...' for more than 5 minutes | CHECK: is the unit connected and responding?");
             return false;
         }
 
         // rows without an id cannot be looked up
-        foreach (var r in dataRows.Where(r => string.IsNullOrWhiteSpace(r.ParameterPath)))
+        foreach (var r in dataRows.Where(r => r.NameId.Length == 0))
         {
-            _log("SKIP  | Row " + r.ExcelRow + " | " + r.ExpectedName + " | no RxPath defined");
+            _log("SKIP  | Row " + r.ExcelRow + " | " + r.ExpectedName + " | no Name Automation ID in the Excel");
             _skip++;
         }
 
-        var runnable = dataRows.Where(r => !string.IsNullOrWhiteSpace(r.ParameterPath)).ToList();
+        var runnable = dataRows.Where(r => r.NameId.Length > 0).ToList();
         var sw = Stopwatch.StartNew();
 
-        foreach (var scope in runnable.GroupBy(r => IsGroupRow(r) ? GroupScope : r.Channel))
+        foreach (var scope in runnable.GroupBy(r => ConfigureNav.ScopeOf(r.Channel, r.ExpectedName)))
         {
-            string scopeName = scope.Key == GroupScope ? "Group Channel Control" : scope.Key > 0 ? "Channel " + scope.Key : "System";
+            string scopeName = scope.Key == ConfigureNav.GroupScope ? "Group Channel Control" : scope.Key > 0 ? "Channel " + scope.Key : "System";
             var pending = scope.ToList();
             _log("INFO  | scope " + scopeName + ": " + pending.Count + " parameters to check (page scan)");
 
-            string? crumb = SelectScope(mainWindow, scope.Key);
+            string? crumb = ConfigureNav.SelectScope(mainWindow, scope.Key);
             if (crumb == null)
             {
-                _log("FAIL  | " + scopeName + " | the tree node '" + (scope.Key == GroupScope ? "Group Channel Control" : scope.Key > 0 ? "Channel " + scope.Key + " Parameters" : "System Parameters") + "' could not be selected - breadcrumb now: '" + ReadBreadcrumb(mainWindow) + "'");
+                _log("FAIL  | " + scopeName + " | the tree node '" + (scope.Key == ConfigureNav.GroupScope ? "Group Channel Control" : scope.Key > 0 ? "Channel " + scope.Key + " Parameters" : "System Parameters") + "' could not be selected - breadcrumb now: '" + ConfigureNav.ReadBreadcrumb(mainWindow) + "'");
                 _log("STOPPED | halted after first mismatch - remaining parameters were not checked");
                 return false;
             }
@@ -150,64 +144,6 @@ public class ConfigureCompareParametersToExcelTest
     }
 
     // ------------------------------------------------------------------ page scan
-
-    private static AutomationElement[] TreeItems(Window w) => w.FindAllDescendants(cf => cf.ByControlType(ControlType.TreeItem));
-
-    // Selects "System Parameters" / "Channel N Parameters" in the Configure tree and waits until the GUI's breadcrumb says so.
-    // Returns the breadcrumb text, or null when it did not work.
-    private string? SelectScope(Window w, int channel)
-    {
-        string nodeName = channel == GroupScope ? "Group Channel Control" : channel > 0 ? "Channel " + channel + " Parameters" : "System Parameters";
-        var node = TreeItems(w).FirstOrDefault(x => x.Name == nodeName);
-        if (node == null && channel > 0)   // (GroupScope is a top-level node, nothing to expand)
-        {
-            TreeItems(w).FirstOrDefault(x => x.Name == "Channel Parameters")?.Patterns.ExpandCollapse.PatternOrDefault?.Expand();
-            Thread.Sleep(600);
-            node = TreeItems(w).FirstOrDefault(x => x.Name == nodeName);
-        }
-
-        if (node == null)
-        {
-            // the tree is virtualized too: scroll it until the node is realized
-            var tree = w.FindFirstDescendant(cf => cf.ByAutomationId("Parameters_TreeView"));
-            var scroll = tree?.Patterns.Scroll.PatternOrDefault;
-            if (scroll != null)
-            {
-                for (double pct = 0; pct <= 100 && node == null; pct += 10)
-                {
-                    scroll.SetScrollPercent(-1, pct);
-                    Thread.Sleep(250);
-                    node = TreeItems(w).FirstOrDefault(x => x.Name == nodeName);
-                }
-            }
-        }
-
-        if (node == null)
-        {
-            return null;
-        }
-
-        node.Patterns.SelectionItem.PatternOrDefault?.Select();
-        var swWait = Stopwatch.StartNew();
-        while (swWait.ElapsedMilliseconds < 6000)
-        {
-            string crumb = ReadBreadcrumb(w);
-            bool ok = channel == GroupScope
-                ? crumb.Contains("Group Channel Control", StringComparison.Ordinal)
-                : channel > 0
-                    ? crumb.Contains("Channel " + channel + " Parameters", StringComparison.Ordinal)
-                    : crumb.Contains("System Parameters", StringComparison.Ordinal) && !crumb.Contains("Channel", StringComparison.Ordinal);
-            if (ok)
-            {
-                Thread.Sleep(300);       // let the list rebuild after the selection
-                return crumb;
-            }
-
-            Thread.Sleep(150);
-        }
-
-        return null;
-    }
 
     // Scrolls the scope's parameter list in half-page steps (virtualized: only the visible rows exist) and compares every wanted row
     // as soon as it is visible. Rows left in `pending` were not seen.
@@ -245,8 +181,8 @@ public class ConfigureCompareParametersToExcelTest
 
             foreach (var row in pending.ToList())
             {
-                string nameId = ExtractAutomationId(row.ParameterPath)!;
-                string? valueId = ExtractAutomationId(row.ValuePath);
+                string nameId = row.NameId;
+                string? valueId = row.ValueId.Length > 0 ? row.ValueId : null;
                 if (!visible.Contains(nameId) || (valueId != null && !visible.Contains(valueId)))
                 {
                     continue;
@@ -304,12 +240,7 @@ public class ConfigureCompareParametersToExcelTest
 
     private bool CheckBySearch(Window w, Row row)
     {
-        string? nameAutomationId = ExtractAutomationId(row.ParameterPath);
-        if (nameAutomationId == null)
-        {
-            _log("FAIL  | Row " + row.ExcelRow + " | could not extract automationid from ParameterPath: " + row.ParameterPath);
-            return false;
-        }
+        string nameAutomationId = row.NameId;
 
         var searchBox = w.FindFirstDescendant(cf => cf.ByAutomationId("searchTextBox"))?.AsTextBox();
         if (searchBox == null)
@@ -328,9 +259,9 @@ public class ConfigureCompareParametersToExcelTest
 
         var nameElement = FindWithRetry(w, nameAutomationId);
         string where = "";       // what the GUI itself says is displayed (breadcrumb + result counter) - proof of WHICH channel was compared
-        if (nameElement != null && IsGroupRow(row))
+        if (nameElement != null && ConfigureNav.ScopeOf(row.Channel, row.ExpectedName) == ConfigureNav.GroupScope)
         {
-            string crumb = ReadBreadcrumb(w);
+            string crumb = ConfigureNav.ReadBreadcrumb(w);
             if (!crumb.Contains("Group Channel Control", StringComparison.Ordinal))
             {
                 _log("FAIL  | Row " + row.ExcelRow + " | Expected='" + row.ExpectedName + "' | the GUI shows '" + crumb + "' instead of the 'Group Channel Control' page");
@@ -354,7 +285,7 @@ public class ConfigureCompareParametersToExcelTest
         }
         else if (nameElement != null)
         {
-            string crumb = ReadBreadcrumb(w);
+            string crumb = ConfigureNav.ReadBreadcrumb(w);
             if (Regex.IsMatch(crumb, @"Channel \d+ Parameters"))
             {
                 _log("FAIL  | Row " + row.ExcelRow + " | Expected='" + row.ExpectedName + "' | a SYSTEM parameter was expected but the GUI shows a channel result: '" + crumb + "'");
@@ -393,7 +324,7 @@ public class ConfigureCompareParametersToExcelTest
             return false;
         }
 
-        string? valueAutomationId = ExtractAutomationId(row.ValuePath);
+        string? valueAutomationId = row.ValueId.Length > 0 ? row.ValueId : null;
         if (valueAutomationId == null)
         {
             _log("SKIP  | Row " + excelRow + " | no Value automationid defined");
@@ -526,66 +457,6 @@ public class ConfigureCompareParametersToExcelTest
         return false;
     }
 
-    // ------------------------------------------------------------------ status bar
-
-    // After opening the Configure tab the GUI keeps loading the unit's parameters ("Fetching parameters... 5/688"): values are blank until done.
-    // The status text can also stay stuck on a number although the GUI is idle: same counter for 8 s with a usable search box = finished.
-    private bool WaitFetchDone(Window window, int timeoutMs)
-    {
-        var sw = Stopwatch.StartNew();
-        long? absentSince = null;
-        string? last = null;
-        long since = 0;
-        while (sw.ElapsedMilliseconds < timeoutMs)
-        {
-            string? progress = null;
-            try
-            {
-                foreach (var t in window.FindAllDescendants(cf => cf.ByControlType(ControlType.Text)))
-                {
-                    var m = FetchingRegex.Match(t.Name ?? "");
-                    if (m.Success)
-                    {
-                        progress = m.Groups[1].Value + "/" + m.Groups[2].Value;
-                        break;
-                    }
-                }
-            }
-            catch
-            {
-                // status bar being re-created
-            }
-
-            if (progress == null)
-            {
-                absentSince ??= sw.ElapsedMilliseconds;
-                if (sw.ElapsedMilliseconds - absentSince >= 1000)
-                {
-                    return true;
-                }
-
-                Thread.Sleep(300);
-                continue;
-            }
-
-            absentSince = null;
-            if (progress != last)
-            {
-                last = progress;
-                since = sw.ElapsedMilliseconds;
-            }
-            else if (sw.ElapsedMilliseconds - since >= 8000 && window.FindFirstDescendant(cf => cf.ByAutomationId("searchTextBox")) is { IsEnabled: true })
-            {
-                _log("WARN  | the status bar is stuck on 'Fetching parameters... " + progress + "' but the search box is enabled - treating the load as finished");
-                return true;
-            }
-
-            Thread.Sleep(1000);
-        }
-
-        return false;
-    }
-
     // ------------------------------------------------------------------ helpers
 
     // The visible Text of the parameter's row that is neither the parameter name nor a unit/description: what the user reads as the value.
@@ -666,16 +537,6 @@ public class ConfigureCompareParametersToExcelTest
         return null;
     }
 
-    // The id columns of the workbook hold the plain AutomationId - used exactly as written.
-    private static string? ExtractAutomationId(string? cell)
-        => string.IsNullOrWhiteSpace(cell) ? null : cell.Trim();
-
-    private static string ReadBreadcrumb(FlaUI.Core.AutomationElements.Window window)
-    {
-        var crumb = window.FindFirstDescendant(cf => cf.ByAutomationId("BreadCrumb"));
-        return crumb == null ? "" : string.Join("", RawTexts(crumb, 0));
-    }
-
     // "3 of 16 matches" - best effort (the counter is a Text without an id); "" when it cannot be found
     private static string ReadCounter(FlaUI.Core.AutomationElements.Window window)
     {
@@ -706,7 +567,7 @@ public class ConfigureCompareParametersToExcelTest
         string text = "";
         for (int step = 0; step < 20; step++)
         {
-            text = ReadBreadcrumb(window);
+            text = ConfigureNav.ReadBreadcrumb(window);
             if (text.Contains(wanted, StringComparison.Ordinal))
             {
                 return (FindWithRetry(window, nameAutomationId), text, ReadCounter(window));

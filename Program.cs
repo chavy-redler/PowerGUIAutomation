@@ -96,6 +96,7 @@ void PrintColored(string stamped, string line)
         "FAIL" or "STOPPED" => ConsoleColor.Red,
         "WARN" or "SKIP" or "NOTE" => ConsoleColor.Yellow,
         "APPLOG" => ConsoleColor.DarkGray,
+        "RESUME" => ConsoleColor.Cyan,
         _ => line.StartsWith("===") ? (line.Contains("PASSED") ? ConsoleColor.Green : ConsoleColor.Red) : ConsoleColor.Gray,
     };
     Write(stamped, color);
@@ -112,6 +113,7 @@ void ShowTestBanner(string? choice, UnitProfile? bannerUnit)
         "1" => "OPERATE - SECOND BAR (UNIT INFO BAR) COMPARISON",
         "2" => "CONFIGURE - PARAMETERS COMPARISON",
         "3" => "CONFIGURE - CHANGE AND RESTORE EVERY PARAMETER",
+        "4" => "CONFIGURE - INPUT VALIDATION (INVALID VALUES MUST BE REJECTED)",
         "5" => "DEBUG TESTS (READ-ONLY)",
         _ => null,
     };
@@ -269,6 +271,7 @@ while (true)
         Console.WriteLine("1. Operate - Second Bar (unit info bar) comparison");
         Console.WriteLine("2. Configure - Parameters comparison");
         Console.WriteLine("3. Configure - Change and restore every parameter (writes to the unit)");
+        Console.WriteLine("4. Configure - Input validation (types invalid values, never saves to flash)");
         Console.WriteLine("5. Debug tests (read-only): Configure comparison on chosen channels / parameters, AutomationId scan");
         Console.WriteLine("U. Change the unit under test");
         Console.WriteLine("0. Exit");
@@ -328,6 +331,20 @@ while (true)
                 var randomChangeTest = new ConfigureChangeAndRestoreAllParametersTest(ExcelPath, Log, unit);
                 bool randomChangePassed = randomChangeTest.Run();
                 Log(randomChangePassed ? "=== TEST PASSED ===" : "=== TEST FAILED ===");
+            }
+            catch (Exception ex)
+            {
+                Log("FAIL | Unhandled error (" + ex.GetType().Name + "): " + ex.Message + " | at " + ex.StackTrace?.Split(Environment.NewLine).FirstOrDefault()?.Trim());
+            }
+            break;
+        case "4":
+            try
+            {
+                if (unit == null) { Log("FAIL | no unit selected - choose the unit (part number) first: press U, or pass unit=RD152"); break; }
+                if (!MasterOk()) { break; }
+                var validationTest = new ConfigureInputValidationTest(ExcelPath, Log, unit);
+                bool validationPassed = validationTest.Run();
+                Log(validationPassed ? "=== TEST PASSED ===" : "=== TEST FAILED ===");
             }
             catch (Exception ex)
             {

@@ -74,6 +74,54 @@ public class ConfigureChangeAndRestoreAllParametersTest
 
     private string[] Sheets => new[] { _unit.ParameterSheet };
 
+    // "stop on fail" (default) halts at the first failure; "continue" goes on with the next parameter and lists every failure at the end
+    // (log + a workbook in the Failures folder next to the logs).
+    private bool _stopOnFail = true;
+    private const int MaxFailuresInARow = 5;      // continue mode only: this many in a row means a problem with the unit/GUI, not with one parameter
+
+    private sealed record FailedParam(Param P, string Step, string Why, bool Restored);
+
+    // What the test is doing right now (shown by the heartbeat and in the failure when nothing moves for NoProgressMinutes).
+    private volatile string _where = "";
+    private long _progressAt = Environment.TickCount64;
+    private const int NoProgressMinutes = 3;
+
+    private void At(string what)
+    {
+        _where = what;
+        _progressAt = Environment.TickCount64;
+    }
+
+    // Runs one parameter on a worker thread: every 30 s without a new step it logs where it is; after NoProgressMinutes without any progress the
+    // run is declared stuck (a UIA call that never returns cannot be interrupted, so the run stops instead of hanging for an hour).
+    private Outcome RunWatched(Func<Outcome> action, out bool stuck)
+    {
+        stuck = false;
+        At("starting");
+        var task = Task.Run(action);
+        long lastBeat = Environment.TickCount64;
+        while (!task.Wait(1000))
+        {
+            long now = Environment.TickCount64;
+            if (now - _progressAt > NoProgressMinutes * 60_000L)
+            {
+                stuck = true;
+                return Outcome.Failed;
+            }
+
+            if (now - lastBeat >= 30_000 && now - _progressAt >= 30_000)
+            {
+                lastBeat = now;
+                _log("INFO  | still working - " + ((now - _progressAt) / 1000) + " s on: " + _where);
+            }
+        }
+
+        return task.GetAwaiter().GetResult();
+    }
+
+    private readonly List<FailedParam> _failures = new();
+    private string _curStep = "", _curWhy = "";      // first failure of the parameter that is being tested
+
     // ------------------------------------------------------------------ model
 
     private sealed class Param
@@ -99,6 +147,12 @@ public class ConfigureChangeAndRestoreAllParametersTest
     {
         string who = p?.Label ?? "(test setup)";
         _log("FAIL  | " + who + " | STEP: " + step + " | WHY: " + why + " | CHECK: " + check);
+        if (p != null && _curStep.Length == 0)
+        {
+            _curStep = step;
+            _curWhy = why;
+        }
+
         if (_failStep.Length == 0)
         {
             _failParam = who;
@@ -111,8 +165,9 @@ public class ConfigureChangeAndRestoreAllParametersTest
     private void LogResult(bool passed, int done, int passedCount, bool restored, int skipped)
     {
         _log("RESULT| " + new string('=', 90));
-        _log("RESULT| " + (passed ? "PASSED" : "FAILED") + " | unit=" + _unit.Name + " | parameters changed+restored=" + passedCount + " of " + done + " checked | skipped=" + skipped);
-        if (!passed && _failStep.Length > 0)
+        _log("RESULT| " + (passed ? "PASSED" : "FAILED") + " | unit=" + _unit.Name + " | parameters changed+restored=" + passedCount + " of " + done + " checked | failed=" + _failures.Count + " | skipped=" + skipped
+             + " | mode=" + (_stopOnFail ? "stop on fail" : "continue"));
+        if (!passed && _stopOnFail && _failStep.Length > 0)
         {
             _log("RESULT| failed parameter : " + _failParam);
             _log("RESULT| failed at step   : " + _failStep);
@@ -122,7 +177,74 @@ public class ConfigureChangeAndRestoreAllParametersTest
                                                        : restored ? "parameter is back at its Excel default (verified)" : "NOT verified - check this parameter on the unit manually"));
         }
 
+        if (_failures.Count > 0 && !_stopOnFail)
+        {
+            _log("RESULT| failed parameters (" + _failures.Count + "):");
+            foreach (var f in _failures)
+            {
+                _log("RESULT|   row " + f.P.ExcelRow + " | " + (f.P.Channel > 0 ? "Channel " + f.P.Channel : "System") + " | " + f.P.Name + " | " + f.Step + " | " + Short(f.Why, 150)
+                     + (f.Restored ? "" : " | DEFAULT NOT VERIFIED - check on the unit"));
+            }
+        }
+
+        string? file = WriteFailuresFile();
+        if (file != null)
+        {
+            _log("RESULT| failures file : " + file);
+        }
+
         _log("RESULT| " + new string('=', 90));
+    }
+
+    private static string Short(string text, int max) => text.Length <= max ? text : text.Substring(0, max) + "...";
+
+    // One row per failed parameter (Excel row first, so a later run can take its parameters from this file): Failures\ChangeAndRestore_<PN>_<time>.xlsx
+    // next to the log files.
+    private string? WriteFailuresFile()
+    {
+        if (_failures.Count == 0)
+        {
+            return null;
+        }
+
+        try
+        {
+            string dir = Path.Combine(AppContext.BaseDirectory, "Failures");
+            Directory.CreateDirectory(dir);
+            string path = Path.Combine(dir, "ChangeAndRestore_" + _unit.PartNumber + "_" + DateTime.Now.ToString("yyyyMMdd_HHmmss") + ".xlsx");
+            using var wb = new XLWorkbook();
+            var ws = wb.AddWorksheet("Failed");
+            string[] headers = { "Excel row", "Channel", "Parameter", "Failed step", "Reason", "Default restored", "Unit", "GUI version", "Run time" };
+            for (int i = 0; i < headers.Length; i++)
+            {
+                ws.Cell(1, i + 1).Value = headers[i];
+                ws.Cell(1, i + 1).Style.Font.Bold = true;
+            }
+
+            int r = 2;
+            foreach (var f in _failures)
+            {
+                ws.Cell(r, 1).Value = f.P.ExcelRow;
+                ws.Cell(r, 2).Value = f.P.Channel > 0 ? f.P.Channel.ToString() : "System";
+                ws.Cell(r, 3).Value = f.P.Name;
+                ws.Cell(r, 4).Value = f.Step;
+                ws.Cell(r, 5).Value = Short(f.Why, 300);
+                ws.Cell(r, 6).Value = f.Restored ? "yes" : "NO";
+                ws.Cell(r, 7).Value = _unit.Name;
+                ws.Cell(r, 8).Value = _guiVersion;
+                ws.Cell(r, 9).Value = DateTime.Now.ToString("yyyy-MM-dd HH:mm");
+                r++;
+            }
+
+            ws.Columns().AdjustToContents();
+            wb.SaveAs(path);
+            return path;
+        }
+        catch (Exception ex)
+        {
+            _log("WARN  | could not write the failures file: " + ex.Message);
+            return null;
+        }
     }
 
     // ------------------------------------------------------------------ entry point
@@ -142,8 +264,28 @@ public class ConfigureChangeAndRestoreAllParametersTest
         Console.WriteLine("WARNING: this test WRITES parameters to the connected unit and saves them to flash (change, Save, Fetch, restore default).");
         Console.WriteLine();
 
+        Console.WriteLine("When a parameter fails:");
+        Console.WriteLine("  1. stop at the first failure  [default]");
+        Console.WriteLine("  2. continue with the next parameter; every failure is listed at the end (and in the Failures folder)");
+        Console.Write("Choice [1]: ");
+        _stopOnFail = (Console.ReadLine() ?? "").Trim() != "2";
+
+        RowSelection? selection;
+        while (true)
+        {
+            Console.Write("Excel rows to run (Enter = all;  e.g.  54-70, 72, 100-  ): ");
+            if (RowSelection.TryParse(Console.ReadLine(), out selection, out string selectionError))
+            {
+                break;
+            }
+
+            Console.WriteLine(selectionError);
+        }
+
+        Console.WriteLine();
+
         _log("START | Configure change-and-restore test | unit=" + _unit.Name + " (sheet '" + _unit.ParameterSheet + "') | GUI version=" + _guiVersion
-             + " | every parameter of the sheet");
+             + " | on failure: " + (_stopOnFail ? "stop" : "continue") + " | rows: " + (selection == null ? "all" : selection.ToString()));
 
         List<Param> all;
         try
@@ -170,9 +312,15 @@ public class ConfigureChangeAndRestoreAllParametersTest
         var excluded = all.Where(NotChanged).ToList();
         var todo = all.Where(p => !NotChanged(p)).ToList();
         _log("INFO  | parameters in Excel=" + all.Count + " | never changed (baud rates, addresses, logic, group control)=" + excluded.Count + " | to check in this run=" + todo.Count);
+        if (selection != null)
+        {
+            todo = todo.Where(p => selection.Contains(p.ExcelRow)).ToList();
+            _log("INFO  | row selection '" + selection + "': " + todo.Count + " parameter(s) (rows of parameters that are never changed are ignored)");
+        }
+
         if (todo.Count == 0)
         {
-            _log("FAIL  | nothing to check - the sheet has no changeable parameter");
+            _log("FAIL  | nothing to check - no changeable parameter in the selected rows");
             return false;
         }
 
@@ -206,13 +354,36 @@ public class ConfigureChangeAndRestoreAllParametersTest
         var search = searchElement.AsTextBox();
         _logElement = window.FindFirstDescendant(cf => cf.ByAutomationId("ConfigureLog"));
 
-        int done = 0, passed = 0, skipped = 0, index = 0;
+        int done = 0, passed = 0, skipped = 0, index = 0, inARow = 0;
         var watch = Stopwatch.StartNew();
         foreach (var p in todo)
         {
             index++;
             _log("DRAW  | " + index + "/" + todo.Count + " | " + p.Label);
-            var outcome = TestOne(window, search, p);
+            Outcome outcome;
+            bool stuck = false;
+            try
+            {
+                outcome = RunWatched(() => TestOne(window, search, p), out stuck);
+            }
+            catch (Exception ex)
+            {
+                Fail(p, "unexpected error", ex.GetType().Name + ": " + ex.Message, "see the message");
+                _lastRestored = false;
+                outcome = Outcome.Failed;
+            }
+
+            if (stuck)
+            {
+                Fail(p, "stuck", "no progress for " + NoProgressMinutes + " minutes - last action: " + _where, "the GUI may be frozen or a UI call is not returning; look at the GUI, restart it if needed and run again from this row");
+                _lastRestored = false;
+                _failures.Add(new FailedParam(p, _curStep, _curWhy, false));
+                _log("STOPPED | the run is stuck and cannot continue safely");
+                _log("RESUME| to continue later answer 'Excel rows to run' with:  " + p.ExcelRow + "-  (after checking this parameter on the unit)");
+                LogResult(false, done + 1, passed, false, skipped);
+                return false;
+            }
+
             if (outcome == Outcome.Skipped)
             {
                 skipped++;
@@ -222,24 +393,54 @@ public class ConfigureChangeAndRestoreAllParametersTest
             done++;
             if (outcome == Outcome.Failed)
             {
-                _log("STOPPED | halted after first failure - remaining parameters were not checked");
-                ClearSearch(window);
-                LogResult(false, done, passed, _lastRestored, skipped);
-                return false;
+                _failures.Add(new FailedParam(p, _curStep, _curWhy, _lastRestored));
+                inARow++;
+                if (_stopOnFail)
+                {
+                    _log("STOPPED | halted after first failure - remaining parameters were not checked");
+                    var nextParam = index < todo.Count ? todo[index] : null;
+                    _log("RESUME| to continue later answer 'Excel rows to run' with:  " + p.ExcelRow + "-  (this parameter again)"
+                         + (nextParam != null ? "   or   " + nextParam.ExcelRow + "-  (skip it, continue with " + nextParam.Name + ")" : ""));
+                    ClearSearch(window);
+                    LogResult(false, done, passed, _lastRestored, skipped);
+                    return false;
+                }
+
+                _log("INFO  | failure " + _failures.Count + " recorded - continuing with the next parameter");
+                if (inARow >= MaxFailuresInARow)
+                {
+                    _log("STOPPED | " + inARow + " parameters failed in a row - that looks like a problem with the unit or the GUI, not with the parameters");
+                    ClearSearch(window);
+                    LogResult(false, done, passed, _lastRestored, skipped);
+                    return false;
+                }
+
+                continue;
             }
 
+            inARow = 0;
             passed++;
         }
 
         ClearSearch(window);
-        _log("DONE  | checked=" + done + " passed=" + passed + " skipped=" + skipped + " | " + watch.Elapsed.TotalMinutes.ToString("0.0") + " min");
-        LogResult(true, done, passed, true, skipped);
-        return true;
+        _log("DONE  | checked=" + done + " passed=" + passed + " failed=" + _failures.Count + " skipped=" + skipped + " | " + watch.Elapsed.TotalMinutes.ToString("0.0") + " min");
+        LogResult(_failures.Count == 0, done, passed, true, skipped);
+        return _failures.Count == 0;
     }
 
     // ------------------------------------------------------------------ one parameter
 
+    // Passed = changed and restored. Failed = anything else (the run stops at the first failure, the parameter is put back to its default first;
+    // the closing lines say how to continue from this parameter with the "Start from" option).
     private enum Outcome { Passed, Failed, Skipped }
+
+    private enum ChangeResult { Ok, NotAccepted, Hard }
+
+    // a value that was not accepted / not kept is a failure of the test (first one is repeated in the closing RESULT lines)
+    private void Finding(Param p, string step, string why)
+    {
+        Fail(p, step, why, "this value/option cannot be set or is not kept - a GUI/unit problem? (start from this row again after it is fixed)");
+    }
 
     private bool _lastRestored = true;
 
@@ -276,9 +477,10 @@ public class ConfigureChangeAndRestoreAllParametersTest
                 return (null, null);
             }
 
-            var list = window.FindFirstDescendant(cf => cf.ByAutomationId("ParametersList"));
+            var list = ConfigureNav.WaitListReady(window, 20000, _log, p.Label);
             if (list == null)
             {
+                _log("NOTE  | " + p.Label + " | the parameter list showed no parameters within 20 s of selecting the page");
                 return (null, null);
             }
 
@@ -297,9 +499,11 @@ public class ConfigureChangeAndRestoreAllParametersTest
                 {
                     list = window.FindFirstDescendant(cf => cf.ByAutomationId("ParametersList")) ?? list;
                     scroll = list.Patterns.Scroll.PatternOrDefault;
-                    if (scrollable && scroll != null)
+                    scrollable = scroll != null && scroll.VerticallyScrollable.ValueOrDefault;      // decided again on every step (the list may become scrollable late)
+                    if (scrollable)
                     {
-                        scroll.SetScrollPercent(-1, Math.Min(pct, 100));
+                        view = Math.Max(5, scroll!.VerticalViewSize.ValueOrDefault);
+                        scroll!.SetScrollPercent(-1, Math.Min(pct, 100));
                         Thread.Sleep(150);
                     }
 
@@ -333,9 +537,12 @@ public class ConfigureChangeAndRestoreAllParametersTest
 
     private Outcome TestOne(Window window, TextBox search, Param p)
     {
+        _curStep = "";
+        _curWhy = "";
         _lastRestored = true;
 
         _log("STEP  | 1 find the parameter (tree page scan)");
+        At("1 locating the parameter");
         var (nameEl, valueEl) = LocateRow(window, search, p, refresh: false);
         if (nameEl == null || valueEl == null)
         {
@@ -347,6 +554,7 @@ public class ConfigureChangeAndRestoreAllParametersTest
         string type = valueEl.ControlType.ToString();
 
         _log("STEP  | 2 read the current value and the constraints (range)");
+        At("2 reading the current value");
         string before = ReadParam(window, p, out var freshValueEl, 4);
         valueEl = freshValueEl ?? valueEl;
         if (before.Length == 0)
@@ -374,10 +582,17 @@ public class ConfigureChangeAndRestoreAllParametersTest
         }
 
         // The constraints text is already inside the parameter's row (hidden) - read it from there; hovering is only the fallback.
-        var tip = ReadConstraintsFromRow(valueEl);
-        if (!tip.Found)
+        bool isChoiceControl = valueEl.ControlType == ControlType.ComboBox || valueEl.ControlType == ControlType.CheckBox;
+        var tip = new Tip();
+        if (!isChoiceControl)
         {
-            tip = ReadTooltip(window, nameEl);
+            At("2 reading the constraints text of the row");
+            tip = ReadConstraintsFromRow(valueEl);
+            if (!tip.Found)
+            {
+                At("2 hovering the parameter name to read its tooltip");
+                tip = ReadTooltip(window, nameEl);
+            }
         }
 
         _log("READ  | " + p.Label + " | control=" + type + " | current='" + before + "' | excel default='" + p.Default + "'"
@@ -440,8 +655,19 @@ public class ConfigureChangeAndRestoreAllParametersTest
                     valueEl = again;
                 }
 
-                ok = ChangeAndVerify(window, search, p, valueEl, before, plan[i].value, plan[i].why);
-                before = plan[i].value;
+                var result = ChangeAndVerify(window, search, p, valueEl, before, plan[i].value, plan[i].why);
+                if (result == ChangeResult.Hard)
+                {
+                    ok = false;
+                }
+                else if (result == ChangeResult.NotAccepted)
+                {
+                    ok = false;
+                }
+                else
+                {
+                    before = plan[i].value;
+                }
             }
         }
         catch (Exception ex)
@@ -463,23 +689,24 @@ public class ConfigureChangeAndRestoreAllParametersTest
         }
 
         _log("STEP  | 6 restore the Excel default '" + p.Default + "' and verify it");
+        At("6 restoring the default '" + p.Default + "'");
         bool restored = RestoreDefault(window, search, p);
         _lastRestored = restored;
         return ok && restored ? Outcome.Passed : Outcome.Failed;
     }
 
     // One change: set `newValue`, Save, Fetch and verify that the unit returns it. False = failed (reason already logged with Fail).
-    private bool ChangeAndVerify(Window window, TextBox search, Param p, AutomationElement valueEl, string before, string newValue, string why)
+    private ChangeResult ChangeAndVerify(Window window, TextBox search, Param p, AutomationElement valueEl, string before, string newValue, string why)
     {
+        At("3 setting the value '" + newValue + "'");
         SetValue(window, valueEl, newValue);
         string shownNow = ReadParam(window, p, out _);
         _log("SET   | " + p.Label + " | '" + before + "' -> '" + newValue + "' | the GUI now shows '" + shownNow + "' | " + why
              + " | Save to Unit Flash is " + (FindByHelp(window, "Save to Unit Flash")?.IsEnabled == true ? "enabled" : "DISABLED"));
         if (!SameValue(shownNow, newValue))
         {
-            Fail(p, "3 set the new value", "after setting '" + newValue + "' the control shows '" + shownNow + "'",
-                 "the value was rejected/not committed (range, focus) - look at the Configure screen");
-            return false;
+            Finding(p, "3 set the new value '" + newValue + "'", "after setting it the control shows '" + shownNow + "' - the value was rejected/not committed (range, focus)");
+            return ChangeResult.NotAccepted;
         }
 
         if (!WaitSaveEnabled(window) && valueEl.ControlType == ControlType.Edit)
@@ -501,29 +728,30 @@ public class ConfigureChangeAndRestoreAllParametersTest
 
         if (!WaitSaveEnabled(window))
         {
-            Fail(p, "3 set the new value", "the value shows '" + shownNow + "' but 'Save to Unit Flash' stayed DISABLED - the GUI did not register a pending change",
-                 "the edit was probably not committed (needs Enter/focus change?) or equals the stored value");
-            return false;
+            Finding(p, "3 set the new value '" + newValue + "'", "the value shows '" + shownNow + "' but 'Save to Unit Flash' stayed DISABLED - the GUI did not register a pending change");
+            return ChangeResult.NotAccepted;
         }
 
-        _log("STEP  | 4 Save to Unit Flash" + (DoReset ? ", Reset Unit" : "") + ", Fetch Parameters");
+        _log("STEP  | 4 Save to Unit Flash" + (DoReset ? ", Reset Unit" : "") + ", read the value back from the unit");
+        At("4 Save and read back '" + newValue + "'");
         if (!SaveResetFetch(window, search, p))
         {
-            return false;
+            return ChangeResult.Hard;
         }
 
         _log("STEP  | 5 verify the value after Save / Fetch");
+        At("5 verifying '" + newValue + "'");
         var (_, v2) = LocateRow(window, search, p, refresh: true);
         string after = v2 == null ? "<NOT FOUND>" : ReadParam(window, p, out _);
         bool changed = SameValue(after, newValue);
         _log((changed ? "PASS  | " : "FAIL  | ") + p.Label + " | after Save/Fetch: expected='" + newValue + "' actual='" + after + "'");
         if (!changed)
         {
-            Fail(p, "5 verify after Save/Fetch", "expected '" + newValue + "' but the unit returned '" + after + "' after fetching",
-                 "the unit did not keep the value (rejected by the unit, or Save did not complete)");
+            Finding(p, "5 verify after Save/Fetch", "expected '" + newValue + "' but the unit returned '" + after + "' - the unit did not keep the value");
+            return ChangeResult.NotAccepted;
         }
 
-        return changed;
+        return ChangeResult.Ok;
     }
 
     private bool WaitSaveEnabled(Window window)
@@ -1297,7 +1525,7 @@ public class ConfigureChangeAndRestoreAllParametersTest
         try
         {
             var row = valueEl.Parent;
-            for (int up = 0; up < 3 && row != null && tip.Text.Length == 0; up++, row = row.Parent)
+            for (int up = 0; up < 2 && row != null && tip.Text.Length == 0; up++, row = row.Parent)      // the row (ParamControlView) and its list item - never the whole list
             {
                 foreach (var t in Walk(row).Where(x => x.ControlType == ControlType.Text))
                 {
@@ -1412,7 +1640,42 @@ public class ConfigureChangeAndRestoreAllParametersTest
         // "Save to Unit Flash" stays disabled until an edit is pending - if it never enables, the edit was not registered
         if (!Press(window, "Save to Unit Flash", "Save", SaveTimeoutMs, p)) return false;
         if (DoReset && !Press(window, "Reset Unit", "Reset", ResetTimeoutMs, p)) return false;
-        if (!Press(window, "Refresh parameters from unit", "Fetch", FetchTimeoutMs, p)) return false;
+        // Read the value back from the unit with the ROW's own refresh button (~0.5 s) instead of the global Fetch Parameters (3-4 s, reloads every
+        // parameter). The global Fetch stays as the fallback when the row's button cannot be found, and after a failure (it also drops pending edits).
+        if (!RefreshRowFromUnit(window, p) && !Press(window, "Refresh parameters from unit", "Fetch", FetchTimeoutMs, p)) return false;
+        return true;
+    }
+
+    // "Refresh parameter value from unit" of the parameter's row (AutomationId = name id + "Refresh"). False = button not available.
+    private bool RefreshRowFromUnit(Window window, Param p)
+    {
+        var list = window.FindFirstDescendant(cf => cf.ByAutomationId("ParametersList"));
+        var button = list?.FindFirstDescendant(cf => cf.ByAutomationId(p.NameId + "Refresh"));
+        if (button == null || !button.IsEnabled)
+        {
+            return false;
+        }
+
+        string before = ReadAppLog();
+        _log("CLICK | " + p.Label + " | Refresh this parameter from the unit");
+        button.AsButton().Invoke();
+        var sw = Stopwatch.StartNew();
+        while (sw.ElapsedMilliseconds < 5000)
+        {
+            Thread.Sleep(150);
+            if (ReadAppLog() != before)
+            {
+                string added = Diff(before, ReadAppLog());
+                if (added.Length > 0)
+                {
+                    _log("APPLOG| " + added.Replace("\r", "").Replace("\n", " ## "));
+                }
+
+                break;
+            }
+        }
+
+        Thread.Sleep(300);
         return true;
     }
 
