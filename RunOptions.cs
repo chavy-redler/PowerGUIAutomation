@@ -63,6 +63,13 @@ public sealed class RowSelection
 
     public bool Contains(int row) => _ranges.Any(r => row >= r.from && row <= r.to);
 
+    // The selection in words, for the log and the failures file (so that someone who only runs the test understands "40-").
+    public string Describe() => string.Join("; ", _ranges.Select(r =>
+        r.from == r.to ? "row " + r.from
+        : r.to == int.MaxValue ? "rows " + r.from + "-end (from row " + r.from + " to the end of the sheet)"
+        : r.from == 0 ? "rows start-" + r.to + " (from the first row up to row " + r.to + ")"
+        : "rows " + r.from + "-" + r.to));
+
     // The question every Configure test asks: which Excel rows to run. Besides "54-70, 72, 100-" the answer can be the PATH of a failures file
     // (drag the file into the console window): then ONLY the rows listed in its "Failed" sheet run. Returns null = every row.
     // 'description' says where the rows came from (for the START line of the log).
@@ -71,7 +78,7 @@ public sealed class RowSelection
         while (true)
         {
             Console.WriteLine("Excel rows to run:");
-            Console.WriteLine("  Enter = all rows,  or e.g.  54-70, 72, 100-");
+            Console.WriteLine("  Enter = all rows,  or e.g.  54-70, 72, 100-    (54-70 = rows 54 to 70;  100- = from row 100 to the end of the sheet;  -60 = from the first row up to row 60)");
             Console.WriteLine("  Only the FAILED rows of an earlier run: drag its failures file (.xlsx) into this window, or paste its path.");
             Console.WriteLine("  The failures files are in: " + RunReport.Dir);
             Console.Write("Rows or failures file: ");
@@ -97,7 +104,7 @@ public sealed class RowSelection
 
             if (TryParse(answer, out var selection, out string error))
             {
-                description = selection == null ? "all" : selection.ToString();
+                description = selection == null ? "all rows" : selection.Describe();
                 return selection;
             }
 

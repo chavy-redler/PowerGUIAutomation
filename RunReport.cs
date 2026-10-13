@@ -8,12 +8,11 @@ namespace PowerGUIAutomation;
 // The file name is fixed when the run starts, so the log can name it and the same file is REWRITTEN: once at the start (Status "Running"),
 // after every failure, and at the end - whatever the end is (finished, stopped at a failure, stuck, Ctrl+C, closed console, crash). A run that
 // is killed hard still leaves the last version. Sheets: "Failed" (written by the test; column A = Excel row, so a later run can take it),
-// "Run" (status, time, mode) and "Not run" (rows that were never reached).
+// "Run" (status, time, unit, rows).
 public sealed class RunReport
 {
     public const string SheetFailed = "Failed";
     public const string SheetRun = "Run";
-    public const string SheetNotRun = "Not run";
     public const string RunningStatus = "Running - not finished (the run ended without a summary: killed or power loss?)";
 
     private readonly Stopwatch _watch = Stopwatch.StartNew();
@@ -63,7 +62,7 @@ public sealed class RunReport
         return t.TotalMinutes >= 1 ? t.Minutes + " min " + t.Seconds.ToString("00") + " s" : t.Seconds + " s";
     }
 
-    // "Run" sheet: one line per fact (the test adds its own counters in 'extra').
+    // "Run" sheet: one line per fact (the test adds its own lines in extra).
     public void AddRunSheet(XLWorkbook wb, IEnumerable<(string Key, string Value)> extra)
     {
         var ws = wb.AddWorksheet(SheetRun);
@@ -80,32 +79,6 @@ public sealed class RunReport
             ws.Cell(i + 1, 1).Value = lines[i].Item1;
             ws.Cell(i + 1, 1).Style.Font.Bold = true;
             ws.Cell(i + 1, 2).Value = lines[i].Item2;
-        }
-
-        ws.Columns().AdjustToContents();
-    }
-
-    // "Not run" sheet: parameters of the selection that the run never reached (only when there are some).
-    public static void AddNotRunSheet(XLWorkbook wb, IReadOnlyList<(int Row, string Channel, string Name)> notRun)
-    {
-        if (notRun.Count == 0)
-        {
-            return;
-        }
-
-        var ws = wb.AddWorksheet(SheetNotRun);
-        string[] head = { "Excel row", "Channel", "Parameter" };
-        for (int i = 0; i < head.Length; i++)
-        {
-            ws.Cell(1, i + 1).Value = head[i];
-            ws.Cell(1, i + 1).Style.Font.Bold = true;
-        }
-
-        for (int i = 0; i < notRun.Count; i++)
-        {
-            ws.Cell(i + 2, 1).Value = notRun[i].Row;
-            ws.Cell(i + 2, 2).Value = notRun[i].Channel;
-            ws.Cell(i + 2, 3).Value = notRun[i].Name;
         }
 
         ws.Columns().AdjustToContents();

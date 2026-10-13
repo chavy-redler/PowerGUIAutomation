@@ -19,7 +19,16 @@ void Log(string line)
         File.AppendAllText(logPath, Environment.NewLine + new string('-', 100) + Environment.NewLine, new System.Text.UTF8Encoding(true));
     }
 
-    File.AppendAllText(logPath, stamped + Environment.NewLine, new System.Text.UTF8Encoding(true));   // the file keeps the plain one-line-per-event text
+    if (line.StartsWith("FAIL", StringComparison.Ordinal))
+    {
+        // a failure stands out when the .txt log is scanned by eye: a ruler of ! above and below (the line itself stays one greppable line)
+        string ruler = new string('!', 100);
+        File.AppendAllText(logPath, ruler + Environment.NewLine + stamped + Environment.NewLine + ruler + Environment.NewLine, new System.Text.UTF8Encoding(true));
+    }
+    else
+    {
+        File.AppendAllText(logPath, stamped + Environment.NewLine, new System.Text.UTF8Encoding(true));   // the file keeps the plain one-line-per-event text
+    }
     PrintColored(stamped, line);
 }
 
@@ -338,6 +347,11 @@ while (true)
         }
     }
 
+    if (choice.Trim() is "1" or "2" or "3" or "4" or "5")
+    {
+        StopControl.Start(Log, graceful: choice.Trim() is "3" or "4");
+    }
+
     switch (choice)
     {
         case "1":
@@ -419,6 +433,7 @@ while (true)
             break;
     }
 
+    StopControl.Stop();
     if (choice.Trim() is "1" or "2" or "3" or "4" or "5")
     {
         ShowTookLine(choice.Trim(), unit);

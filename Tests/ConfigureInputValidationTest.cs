@@ -55,7 +55,7 @@ public class ConfigureInputValidationTest
         public string Label => (Channel > 0 ? "Channel " + Channel + " | " : "System | ") + Name + " (" + Sheet + " row " + ExcelRow + ")";
     }
 
-    private sealed record Finding(Row Row, string Input, string Expected, string Actual, string GuiLog, string Problem);
+    private sealed record Finding(Row Row, string Input, string Expected, string Actual, string GuiLog, string Problem, string Original = "", string Typed = "", string Shown = "");
 
     private bool _stopOnFail = true;
     private bool _stopRequested;
@@ -146,7 +146,7 @@ public class ConfigureInputValidationTest
             if (_current != null)
             {
                 _findings.Add(new Finding(_current, "(interrupted)", "-", "the run was stopped while this parameter was being checked", "",
-                                          "interrupted - a typed value may still be on the unit (Enter applies it, nothing was saved): check this parameter"));
+                                          "The test was stopped by user while modifying this parameter, please verify that the value is correct."));
             }
 
             report.Finish(status);
@@ -203,7 +203,7 @@ public class ConfigureInputValidationTest
                 {
                     lock (_report.Sync)
                     {
-                        _findings.Add(new Finding(_current, "(crash)", "-", ex.GetType().Name + ": " + ex.Message, "", "the test crashed while checking this parameter - check it on the unit"));
+                        _findings.Add(new Finding(_current, "(crash)", "-", ex.GetType().Name + ": " + ex.Message, "", "The test crashed while checking this parameter, please verify that the value is correct."));
                     }
                 }
 
@@ -317,6 +317,14 @@ public class ConfigureInputValidationTest
 
             foreach (var row in scope)
             {
+                if (StopControl.Requested)
+                {
+                    _endStatus = "Stopped by the user (stop key) after finishing the last parameter";
+                    _log("STOPPED | the stop key was pressed - the run stops here, the last parameter was finished and its original value is back");
+                    _log("RESUME| to continue later answer 'Excel rows to run' with:  " + row.ExcelRow + "-  (from this parameter to the end)");
+                    goto Summary;
+                }
+
                 index++;
                 _current = row;
                 _log("DRAW  | " + index + "/" + todo.Count + " | " + row.Label);
@@ -334,7 +342,7 @@ public class ConfigureInputValidationTest
 
                 if (!finished)
                 {
-                    AddFinding(new Finding(row, "(stuck)", "no hang", "no progress for " + NoProgressMinutes + " min - last action: " + _where, "", "the test got stuck (no progress for " + NoProgressMinutes + " minutes) - " + _where));
+                    AddFinding(new Finding(row, "(stuck)", "no hang", "no progress for " + NoProgressMinutes + " min - last action: " + _where, "", "The test got stuck (no progress for " + NoProgressMinutes + " minutes, last action: " + _where + "), please verify that the value is correct."));
                     _log("FAIL  | " + row.Label + " | STEP: " + _where + " | WHY: no progress for " + NoProgressMinutes + " minutes | CHECK: the GUI may be frozen or a UI call is not returning; check the unit and the GUI");
                     _stopRequested = true;
                 }
@@ -465,7 +473,7 @@ public class ConfigureInputValidationTest
                 CheckInput(window, row, original, text, expect, what, tip);
             }
 
-            if (_stopRequested)
+            if (_stopRequested || StopControl.Requested)
             {
                 break;       // the original value has been put back by CheckInput; the run stops after this parameter
             }
@@ -540,7 +548,7 @@ public class ConfigureInputValidationTest
         {
             _log("FAIL  | " + row.Label + " | " + what + " '" + shownText + "' | expected " + expected + " | " + actual + (guiLog.Length > 0 ? " | GUI log: " + guiLog : "")
                  + (expect == Expect.Reject && accepted ? " | THE UNIT HELD THIS INVALID VALUE until it was put back" : ""));
-            AddFinding(new Finding(row, what + " '" + shownText + "'", expected, actual, guiLog, Problem(what, text, expect, expected, actual)));
+            AddFinding(new Finding(row, what + " '" + shownText + "'", expected, actual, guiLog, Problem(what, text, expect, expected, actual), original, shownText, chip ? RejectChipText(tb) : shown));
             _failInARow++;
             if (_stopOnFail || _failInARow >= MaxFailuresInARow)
             {
@@ -582,7 +590,7 @@ public class ConfigureInputValidationTest
                 {
                     string shownHeld = held.Length > 20 ? held.Substring(0, 20) + "..." : held;
                     _log("FAIL  | " + row.Label + " | " + what + " '" + shownText + "' | after the refusal the UNIT holds '" + shownHeld + "' instead of the original '" + original + "'");
-                    AddFinding(new Finding(row, what + " '" + shownText + "'", "the unit keeps '" + original + "'", "unit holds '" + shownHeld + "'", guiLog, "the unit holds '" + shownHeld + "' after the value was refused (original '" + original + "')"));
+                    AddFinding(new Finding(row, what + " '" + shownText + "'", "the unit keeps '" + original + "'", "unit holds '" + shownHeld + "'", guiLog, "After the value was refused, the unit holds “" + shownHeld + "” (the original value was “" + original + "”).", original, shownText, shownHeld));
                     _stopRequested |= _stopOnFail;
                     TypeAndEnter(FindValueElement(window, row) ?? tb, original);      // put the original back
                     WaitForRejectChipGone(window, row, 3000);
@@ -631,17 +639,17 @@ public class ConfigureInputValidationTest
     private static string Problem(string what, string text, Expect expect, string expected, string actual)
     {
         string shown = text.Length > 20 ? text.Substring(0, 20) + "..." : text;
-        if (what.StartsWith("Max (", StringComparison.Ordinal)) return "does not accept Max (" + shown + ")";
-        if (what.StartsWith("Min (", StringComparison.Ordinal)) return "does not accept Min (" + shown + ")";
-        if (what == "Max+1") return "accepts a value above Max (" + shown + ")";
-        if (what == "Min-1") return "accepts a value below Min (" + shown + ")";
-        if (what == "letters") return "accepts letters ('" + shown + "')";
-        if (what == "digit mixed with letters") return "accepts a digit mixed with letters ('" + shown + "')";
-        if (what == "empty") return "accepts an empty value";
-        if (what == "Hebrew letters") return "accepts Hebrew letters";
-        if (what.StartsWith("Max+1 characters", StringComparison.Ordinal)) return "accepts text longer than the maximum (" + text.Length + " characters)";
-        if (what.StartsWith("English letters", StringComparison.Ordinal)) return "does not accept valid text (English letters, digit, space, symbols)";
-        return what + " - expected " + expected + ", GUI: " + actual;
+        if (what.StartsWith("Max (", StringComparison.Ordinal)) return "The field does not accept the maximum value (" + shown + ").";
+        if (what.StartsWith("Min (", StringComparison.Ordinal)) return "The field does not accept the minimum value (" + shown + ").";
+        if (what == "Max+1") return "The field accepts a value above the maximum (" + shown + ").";
+        if (what == "Min-1") return "The field accepts a value below the minimum (" + shown + ").";
+        if (what == "letters") return "The field accepts letters (“" + shown + "”).";
+        if (what == "digit mixed with letters") return "The field accepts a digit mixed with letters (“" + shown + "”).";
+        if (what == "empty") return "The field accepts an empty value.";
+        if (what == "Hebrew letters") return "The field accepts Hebrew letters.";
+        if (what.StartsWith("Max+1 characters", StringComparison.Ordinal)) return "The field accepts text longer than the maximum (" + text.Length + " characters).";
+        if (what.StartsWith("English letters", StringComparison.Ordinal)) return "The field does not accept valid text (English letters, digit, space, symbols).";
+        return "Unexpected result for " + what + ": expected " + expected + ", the GUI shows " + actual + ".";
     }
 
     private static bool SameText(string a, string b)
@@ -728,6 +736,28 @@ public class ConfigureInputValidationTest
         catch
         {
             return false;
+        }
+    }
+
+    // The text of the chip (what the unit holds, e.g. "-1" or the last accepted value), "" when there is none.
+    private static string RejectChipText(AutomationElement valueEl)
+    {
+        try
+        {
+            var item = RowItem(valueEl);
+            if (item == null)
+            {
+                return "";
+            }
+
+            double right = valueEl.BoundingRectangle.Right;
+            return Walk(item, 0).Where(t => t.ControlType == ControlType.Text && string.IsNullOrEmpty(t.AutomationId) && !string.IsNullOrWhiteSpace(t.Name)
+                                            && !t.Properties.IsOffscreen.ValueOrDefault && t.BoundingRectangle.Width > 0 && t.BoundingRectangle.X >= right - 2)
+                                .Select(t => t.Name.Trim()).FirstOrDefault() ?? "";
+        }
+        catch
+        {
+            return "";
         }
     }
 
@@ -1026,7 +1056,7 @@ public class ConfigureInputValidationTest
 
                 using var wb = new XLWorkbook();
                 var ws = wb.AddWorksheet(RunReport.SheetFailed);
-                string[] head = { "Excel row", "Channel", "Parameter", "Why it failed", "Input typed", "Expected", "GUI result", "GUI log", "Unit", "GUI version", "Run time" };
+                string[] head = { "Excel row", "Channel", "Parameter", "Failure type", "Previous value", "Value we tried to write", "Value read from the unit", "Unit", "GUI version", "Run time" };
                 for (int i = 0; i < head.Length; i++)
                 {
                     ws.Cell(1, i + 1).Value = head[i];
@@ -1040,34 +1070,22 @@ public class ConfigureInputValidationTest
                     ws.Cell(r, 2).Value = f.Row.Channel > 0 ? f.Row.Channel.ToString() : "System";
                     ws.Cell(r, 3).Value = f.Row.Name;
                     ws.Cell(r, 4).Value = f.Problem;
-                    ws.Cell(r, 5).Value = f.Input;
-                    ws.Cell(r, 6).Value = f.Expected;
-                    ws.Cell(r, 7).Value = f.Actual;
-                    ws.Cell(r, 8).Value = f.GuiLog.Length > 200 ? f.GuiLog.Substring(0, 200) + "..." : f.GuiLog;
-                    ws.Cell(r, 9).Value = _unit.Name;
-                    ws.Cell(r, 10).Value = _guiVersion;
-                    ws.Cell(r, 11).Value = DateTime.Now.ToString("yyyy-MM-dd HH:mm");
+                    ws.Cell(r, 5).Value = f.Original;
+                    ws.Cell(r, 6).Value = f.Typed;
+                    ws.Cell(r, 7).Value = f.Shown;
+                    ws.Cell(r, 8).Value = _unit.Name;
+                    ws.Cell(r, 9).Value = _guiVersion;
+                    ws.Cell(r, 10).Value = DateTime.Now.ToString("yyyy-MM-dd HH:mm");
                     r++;
                 }
 
                 ws.Columns().AdjustToContents();
 
-                // parameters of this run that were never reached (a finished run has none; a stopped one lists where to go on)
-                var failedRows = new HashSet<int>(_findings.Select(f => f.Row.ExcelRow));
-                var notRun = _todo.Skip(_finished).Where(x => !failedRows.Contains(x.ExcelRow))
-                                  .Select(x => (x.ExcelRow, x.Channel > 0 ? x.Channel.ToString() : "System", x.Name)).ToList();
                 report.AddRunSheet(wb, new[]
                 {
-                    ("Test", "Configure - input validation"),
                     ("Unit", _unit.Name),
-                    ("GUI version", _guiVersion),
-                    ("On failure", _stopOnFail ? "stop at the first failure" : "continue"),
                     ("Rows of this run", _rowsDescription),
-                    ("Parameters in this run", _todo.Count.ToString()),
-                    ("Inputs checked / passed / failed", _inputs + " / " + _passed + " / " + _findings.Count),
-                    ("Not reached", notRun.Count.ToString()),
                 });
-                RunReport.AddNotRunSheet(wb, notRun);
                 report.Save(wb);
                 return report.Path;
             }

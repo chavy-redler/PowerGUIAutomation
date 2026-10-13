@@ -38,20 +38,25 @@ public static class TestInstructions
                 AddConfigureCommon(items, sheetNote);
                 AddResetNote(items);
                 items.Add(new("What it does", "WRITES to the unit and saves to flash: every parameter is changed, saved, read back and restored to its Excel default. Never changed: baud rates, addresses, Logic, Group Control."));
-                items.Add(new("Stopping", "Ctrl+C stops at once. The parameter being tested may stay on a changed value: it is listed in the failures file - check it on the unit."));
+                items.Add(new("Stopping", StopControl.KeyName + " (works while the GUI is in front) stops the test after the parameter that is being checked, and writes the failures file. Press it again to stop at once: the parameter being tested may stay on a changed value, it is listed in the failures file - check it on the unit. Ctrl+C works only when this console window is in front."));
                 break;
             case "4":
                 title = "Configure - Input validation";
                 AddConfigureCommon(items, sheetNote);
                 items.Add(new("GUI version", "Developed on Power Rider Studio 2.1.2 or newer; on an older GUI the results are not validated."));
                 items.Add(new("What it does", "Types invalid values (letters, empty, Min-1, Max+1, Hebrew, too-long text) into the text fields of System and channel 1 and checks that the GUI refuses them, and that valid ones (Min, Max, text) are accepted. NEVER presses Save; the original value is put back after every input."));
-                items.Add(new("Stopping", "Ctrl+C stops at once. A value typed at that moment (Enter applies it, nothing is saved) may still be on the unit: check the parameter listed in the failures file."));
+                items.Add(new("Stopping", StopControl.KeyName + " (works while the GUI is in front) stops the test after the parameter that is being checked, and writes the failures file. Press it again to stop at once: a value typed at that moment (Enter applies it, nothing is saved) may still be on the unit - check the parameter listed in the failures file. Ctrl+C works only when this console window is in front."));
                 break;
             default:
                 title = "Debug tests";
                 AddConfigureCommon(items, sheetNote);
                 items.Add(new("What it does", "Read-only: 1 = test 2 only on chosen channels / parameters;  2 = AutomationId scan of all parameters (report to a new workbook in the Excel folder)."));
                 break;
+        }
+
+        if (choice is not ("3" or "4"))
+        {
+            items.Add(new("Stopping", StopControl.KeyName + " (works while the GUI is in front) stops the test at once. Ctrl+C works only when this console window is in front."));
         }
 
         return Frame("Before test " + choice + " - " + title, items);
