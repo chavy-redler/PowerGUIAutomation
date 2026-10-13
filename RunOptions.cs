@@ -57,7 +57,118 @@ public sealed class RowSelection
         return true;
     }
 
+    // Set when the rows come from the failures file of an earlier run (see Ask): the file, and the parameter name expected at each row.
+    public string? SourceFile { get; private set; }
+    private Dictionary<int, string> _expectedNames = new();
+
     public bool Contains(int row) => _ranges.Any(r => row >= r.from && row <= r.to);
+
+    // The question every Configure test asks: which Excel rows to run. Besides "54-70, 72, 100-" the answer can be the PATH of a failures file
+    // (drag the file into the console window): then ONLY the rows listed in its "Failed" sheet run. Returns null = every row.
+    // 'description' says where the rows came from (for the START line of the log).
+    public static RowSelection? Ask(string filePrefix, string partNumber, out string description)
+    {
+        while (true)
+        {
+            Console.WriteLine("Excel rows to run:");
+            Console.WriteLine("  Enter = all rows,  or e.g.  54-70, 72, 100-");
+            Console.WriteLine("  Only the FAILED rows of an earlier run: drag its failures file (.xlsx) into this window, or paste its path.");
+            Console.WriteLine("  The failures files are in: " + RunReport.Dir);
+            Console.Write("Rows or failures file: ");
+            string? answer = Console.ReadLine();
+            string text = (answer ?? "").Trim().Trim('"');
+            if (text.Equals("F", StringComparison.OrdinalIgnoreCase))
+            {
+                Console.WriteLine("To run only the failed rows give the failures FILE (drag the .xlsx into this window), not a letter.");
+                continue;
+            }
+
+            if (text.EndsWith(".xlsx", StringComparison.OrdinalIgnoreCase))
+            {
+                var fromFile = FromFailuresFile(text, filePrefix, partNumber);
+                if (fromFile != null)
+                {
+                    description = "ONLY the failed rows of " + Path.GetFileName(fromFile.SourceFile) + " (" + fromFile._ranges.Count + " row(s): " + fromFile + ")";
+                    return fromFile;
+                }
+
+                continue;
+            }
+
+            if (TryParse(answer, out var selection, out string error))
+            {
+                description = selection == null ? "all" : selection.ToString();
+                return selection;
+            }
+
+            Console.WriteLine(error);
+        }
+    }
+
+    // null = the file cannot be used (the reason is printed) and the question is asked again.
+    private static RowSelection? FromFailuresFile(string path, string filePrefix, string partNumber)
+    {
+        if (!File.Exists(path))
+        {
+            Console.WriteLine("File not found: " + path);
+            return null;
+        }
+
+        if (!RunReport.TryRead(path, out var chosen, out string readError))
+        {
+            Console.WriteLine("Cannot use that file: " + readError);
+            return null;
+        }
+
+        if (chosen!.Unit.Length > 0 && !chosen.Unit.StartsWith(partNumber + " ", StringComparison.OrdinalIgnoreCase))
+        {
+            Console.WriteLine("That file is from a run on unit '" + chosen.Unit + "' - the Excel rows belong to another unit than " + partNumber + ".");
+            return null;
+        }
+
+        if (chosen.Failed.Count == 0)
+        {
+            Console.WriteLine("That file lists no failed rows.");
+            return null;
+        }
+
+        if (!Path.GetFileName(path).StartsWith(filePrefix + "_", StringComparison.OrdinalIgnoreCase))
+        {
+            Console.WriteLine("Note: the file is from another test than this one - only its Excel row numbers are used.");
+        }
+
+        var selection = new RowSelection { SourceFile = chosen.Path };
+        foreach (var row in chosen.Failed)
+        {
+            selection._ranges.Add((row.Row, row.Row));
+            selection._expectedNames[row.Row] = row.Name;
+        }
+
+        return selection;
+    }
+
+    // Excel rows move when someone edits the master workbook. Compares the parameter name at each row with the name the failures file had.
+    // 'found' = (excel row, name now). Returns one text per row that does not match (empty when the rows come from typing, not from a file).
+    public List<string> NameMismatches(IEnumerable<(int Row, string Name)> found)
+    {
+        var result = new List<string>();
+        var foundRows = new HashSet<int>();
+        foreach (var (row, name) in found)
+        {
+            foundRows.Add(row);
+            if (_expectedNames.TryGetValue(row, out var expected) && expected.Length > 0 && !string.Equals(expected, name, StringComparison.OrdinalIgnoreCase))
+            {
+                result.Add("row " + row + ": the failures file says '" + expected + "' but the master workbook now has '" + name + "'");
+            }
+        }
+
+        foreach (var (row, expected) in _expectedNames.Where(e => !foundRows.Contains(e.Key)).Select(e => (e.Key, e.Value)))
+        {
+            result.Add("row " + row + " ('" + expected + "') from the failures file is not among the parameters this run can check");
+        }
+
+        return result;
+    }
 
     public override string ToString() => string.Join(", ", _ranges.Select(r => r.from == r.to ? r.from.ToString()
                                                                                  : r.to == int.MaxValue ? r.from + "-"

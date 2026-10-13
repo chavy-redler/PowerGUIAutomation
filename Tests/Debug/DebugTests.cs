@@ -26,6 +26,7 @@ public class DebugTests
         Console.WriteLine("  2. DebugAutomationIdScanTest - AutomationId scan of all parameters (report to a new Excel file)");
         Console.Write("Choice [1]: ");
         string pick = (Console.ReadLine() ?? "").Trim();
+        RunClock.Start();      // the menu's "took" time starts after the choice
         if (pick == "2")
         {
             _log("START | DebugAutomationIdScanTest | unit=" + _unit.Name);

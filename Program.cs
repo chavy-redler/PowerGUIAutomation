@@ -146,6 +146,38 @@ void ShowTestBanner(string? choice, UnitProfile? bannerUnit)
                        + "TEST SELECTED: " + title + " | " + unitText + Environment.NewLine + Environment.NewLine, new System.Text.UTF8Encoding(true));
 }
 
+// The "before you start" frame (TestInstructions.cs) for the chosen test: console in color, log file as plain lines.
+void ShowInstructions(string choice, UnitProfile? instructionUnit)
+{
+    string sheetNote = instructionUnit == null ? "" : "Its sheet '" + instructionUnit.ParameterSheet + "' must exist and be valid.";
+    var lines = TestInstructions.Build(choice, instructionUnit, sheetNote);
+    Console.OutputEncoding = System.Text.Encoding.UTF8;
+    foreach (var (text, color) in lines)
+    {
+        Write(text, color);
+    }
+
+    Console.WriteLine();
+    File.AppendAllText(logPath, string.Join(Environment.NewLine, lines.Select(l => l.Text)) + Environment.NewLine + Environment.NewLine, new System.Text.UTF8Encoding(true));
+}
+
+// Last line of every test: how long it took (RunClock: from the real start, the menu and the questions are not counted). Plain ruler line with no
+// "TAG |" and no time stamp, so it stands out when the .txt log is scanned afterwards.
+void ShowTookLine(string choice, UnitProfile? tookUnit)
+{
+    if (!RunClock.Running)
+    {
+        return;
+    }
+
+    string text = "  TEST " + choice + (tookUnit != null ? " (" + tookUnit.PartNumber + ")" : "") + " TOOK " + RunReport.Format(RunClock.Elapsed)
+                  + "   (" + RunClock.StartedAt.ToString("HH:mm:ss") + " - " + DateTime.Now.ToString("HH:mm:ss") + ")  ";
+    string line = "════════" + text + new string('═', 8);
+    Console.WriteLine();
+    Write(line, ConsoleColor.Cyan);
+    File.AppendAllText(logPath, Environment.NewLine + line + Environment.NewLine, new System.Text.UTF8Encoding(true));
+}
+
 // The master workbook must exist at ExcelPath and be CLOSED in Excel while a test runs (an open workbook is locked / may be saved over).
 bool MasterOk()
 {
@@ -167,23 +199,20 @@ bool MasterOk()
     }
 }
 
-// Configure tests assume every parameter starts at its Excel default, so the unit must be reset to default BEFORE the run.
-bool UnitResetConfirmed(bool interactive)
+// Characters typed while a test ran can end up in the console input buffer; they must not be read as answers of the next menu question.
+void FlushConsoleInput()
 {
-    if (!interactive)
+    try
     {
-        Log("WARN | scripted run - make sure the unit was reset to default before this test (not asked)");
-        return true;
+        while (Console.KeyAvailable)
+        {
+            Console.ReadKey(true);
+        }
     }
-
-    Console.Write("Was the unit RESET TO DEFAULT before this test? (Y/N): ");
-    if (string.Equals(Console.ReadLine()?.Trim(), "Y", StringComparison.OrdinalIgnoreCase))
+    catch (InvalidOperationException)
     {
-        return true;
+        // input is redirected (scripted run) - nothing to flush
     }
-
-    Log("ABORT | reset the unit to default first, then run the test again");
-    return false;
 }
 
 // The unit under test (chosen by PART NUMBER) decides which Excel sheets the tests read (see UnitProfile.cs), how many
@@ -275,6 +304,7 @@ while (true)
         Console.WriteLine("5. Debug tests (read-only): Configure comparison on chosen channels / parameters, AutomationId scan");
         Console.WriteLine("U. Change the unit under test");
         Console.WriteLine("0. Exit");
+        FlushConsoleInput();
         Console.Write("Choice: ");
         choice = Console.ReadLine();
     }
@@ -293,6 +323,20 @@ while (true)
 
     Log("MENU | choice selected: " + choice);
     ShowTestBanner(choice, unit);
+    RunClock.Reset();
+    if (choice.Trim() is "1" or "2" or "3" or "4" or "5")
+    {
+        ShowInstructions(choice.Trim(), unit);
+        if (!nonInteractive)
+        {
+            Console.Write("Press Enter to start the test (Q = back to the menu): ");
+            if (string.Equals(Console.ReadLine()?.Trim(), "Q", StringComparison.OrdinalIgnoreCase))
+            {
+                Log("MENU | test not started - back to the menu");
+                continue;
+            }
+        }
+    }
 
     switch (choice)
     {
@@ -300,6 +344,7 @@ while (true)
             try
             {
                 if (!MasterOk()) { break; }
+                RunClock.Start();
                 var test = new OperateSecondBarTest(ExcelPath, Log);
                 bool passed = test.Run();
                 Log(passed ? "=== TEST PASSED ===" : "=== TEST FAILED ===");
@@ -313,7 +358,8 @@ while (true)
             try
             {
                 if (unit == null) { Log("FAIL | no unit selected - choose the unit (part number) first: press U, or pass unit=RD152"); break; }
-                if (!MasterOk() || !UnitResetConfirmed(!nonInteractive)) { break; }
+                if (!MasterOk()) { break; }
+                RunClock.Start();
                 var configureTest = new ConfigureCompareParametersToExcelTest(ExcelPath, Log, new[] { unit.ParameterSheet }, unit);
                 bool configurePassed = configureTest.Run();
                 Log(configurePassed ? "=== TEST PASSED ===" : "=== TEST FAILED ===");
@@ -327,7 +373,8 @@ while (true)
             try
             {
                 if (unit == null) { Log("FAIL | no unit selected - choose the unit (part number) first: press U, or pass unit=RD152"); break; }
-                if (!MasterOk() || !UnitResetConfirmed(!nonInteractive)) { break; }
+                if (!MasterOk()) { break; }
+                RunClock.Start();
                 var randomChangeTest = new ConfigureChangeAndRestoreAllParametersTest(ExcelPath, Log, unit);
                 bool randomChangePassed = randomChangeTest.Run();
                 Log(randomChangePassed ? "=== TEST PASSED ===" : "=== TEST FAILED ===");
@@ -342,6 +389,7 @@ while (true)
             {
                 if (unit == null) { Log("FAIL | no unit selected - choose the unit (part number) first: press U, or pass unit=RD152"); break; }
                 if (!MasterOk()) { break; }
+                RunClock.Start();
                 var validationTest = new ConfigureInputValidationTest(ExcelPath, Log, unit);
                 bool validationPassed = validationTest.Run();
                 Log(validationPassed ? "=== TEST PASSED ===" : "=== TEST FAILED ===");
@@ -356,6 +404,7 @@ while (true)
             {
                 if (unit == null) { Log("FAIL | no unit selected - choose the unit (part number) first: press U, or pass unit=RD152"); break; }
                 if (!MasterOk()) { break; }
+                RunClock.Start();
                 var debugTest = new DebugTests(ExcelPath, Log, unit);
                 bool debugPassed = debugTest.Run();
                 Log(debugPassed ? "=== TEST PASSED ===" : "=== TEST FAILED ===");
@@ -368,6 +417,11 @@ while (true)
         default:
             Log("MENU | unknown choice: " + choice);
             break;
+    }
+
+    if (choice.Trim() is "1" or "2" or "3" or "4" or "5")
+    {
+        ShowTookLine(choice.Trim(), unit);
     }
 }
 

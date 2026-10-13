@@ -55,7 +55,7 @@ public class ConfigureInputValidationTest
         public string Label => (Channel > 0 ? "Channel " + Channel + " | " : "System | ") + Name + " (" + Sheet + " row " + ExcelRow + ")";
     }
 
-    private sealed record Finding(Row Row, string Input, string Expected, string Actual, string GuiLog);
+    private sealed record Finding(Row Row, string Input, string Expected, string Actual, string GuiLog, string Problem);
 
     private bool _stopOnFail = true;
     private bool _stopRequested;
@@ -98,10 +98,72 @@ public class ConfigureInputValidationTest
     }
 
     private readonly List<Finding> _findings = new();
+
+    // The failures workbook of THIS run (fixed name, rewritten after every failing input and at the end - see RunReport) and what it needs to say
+    // about a run that did not reach its end: the rows of the run, how many are finished, and the one being checked right now.
+    private const string FilePrefix = "InputValidation";
+    private RunReport? _report;
+    private List<Row> _todo = new();
+    private int _finished;
+    private Row? _current;
+    private string _rowsDescription = "all";
+    private string? _endStatus;
+
+    // Recorded under the report's lock: ValidateOne runs on a worker thread and the Ctrl+C / console-close handler writes the workbook from another one.
+    private void AddFinding(Finding f)
+    {
+        if (_report == null)
+        {
+            _findings.Add(f);
+            return;
+        }
+
+        lock (_report.Sync)
+        {
+            _findings.Add(f);
+        }
+
+        WriteFailuresFile();      // the file is current after every failure, not only at the end of a long run
+    }
+
+    // Ctrl+C or closing the console: the run ends here, so the file must say so. The row being checked is listed - a value typed there is applied by
+    // Enter (nothing is saved to flash) and may still be on the unit.
+    private void Interrupted(string status)
+    {
+        var report = _report;
+        if (report == null)
+        {
+            return;
+        }
+
+        lock (report.Sync)
+        {
+            if (report.Finished)
+            {
+                return;
+            }
+
+            if (_current != null)
+            {
+                _findings.Add(new Finding(_current, "(interrupted)", "-", "the run was stopped while this parameter was being checked", "",
+                                          "interrupted - a typed value may still be on the unit (Enter applies it, nothing was saved): check this parameter"));
+            }
+
+            report.Finish(status);
+        }
+
+        _log("STOPPED | " + status + (_current != null ? " | interrupted while checking: " + _current.Label + " - check this parameter on the unit" : ""));
+        WriteFailuresFile();
+        _log("RESULT| run time        : " + RunReport.Format(report.Elapsed));
+        _log("RESULT| failures file   : " + report.Path);
+    }
+
     private int _failInARow;
     private int _inputs, _passed, _skippedParams, _params;
     private readonly Dictionary<int, double> _lastPct = new();
+    private Dictionary<int, List<int>> _scopeRows = new();           // per scope: the Excel rows in list order
     private AutomationElement? _logElement;
+    private Window? _window;
 
     public ConfigureInputValidationTest(string excelPath, Action<string> log, UnitProfile unit)
     {
@@ -110,7 +172,58 @@ public class ConfigureInputValidationTest
         _unit = unit;
     }
 
+    // The run is wrapped so that Ctrl+C, closing the console, a crash and a setup failure all leave the failures file with the right status.
     public bool Run()
+    {
+        ConsoleCancelEventHandler onCancel = (_, _) => Interrupted("Stopped by the user (Ctrl+C)");
+        EventHandler onExit = (_, _) => Interrupted("Stopped - the console was closed or the program was ended");
+        Console.CancelKeyPress += onCancel;
+        AppDomain.CurrentDomain.ProcessExit += onExit;
+        try
+        {
+            bool ok = RunCore();
+            if (_report != null && !_report.Finished)
+            {
+                // left before the summary (the unit is not the right one, the Configure tab did not open, ...): nothing was checked
+                _report.Finish("Test setup failed - nothing was checked");
+                WriteFailuresFile();
+                _log("RESULT| status          : " + _report.Status);
+                _log("RESULT| total run time  : " + RunReport.Format(_report.Elapsed));
+                _log("RESULT| failures file   : " + _report.Path);
+            }
+
+            return ok;
+        }
+        catch (Exception ex)
+        {
+            if (_report != null && !_report.Finished)
+            {
+                // an exception that nothing caught: "test failed" in the middle - the file says so and names the row that was being checked
+                if (_current != null)
+                {
+                    lock (_report.Sync)
+                    {
+                        _findings.Add(new Finding(_current, "(crash)", "-", ex.GetType().Name + ": " + ex.Message, "", "the test crashed while checking this parameter - check it on the unit"));
+                    }
+                }
+
+                _report.Finish("Test failed - crashed: " + ex.GetType().Name + ": " + ex.Message);
+                WriteFailuresFile();
+                _log("FAIL  | the test crashed: " + ex.GetType().Name + ": " + ex.Message);
+                _log("RESULT| total run time  : " + RunReport.Format(_report.Elapsed));
+                _log("RESULT| failures file   : " + _report.Path);
+            }
+
+            throw;
+        }
+        finally
+        {
+            Console.CancelKeyPress -= onCancel;
+            AppDomain.CurrentDomain.ProcessExit -= onExit;
+        }
+    }
+
+    private bool RunCore()
     {
         string onlyName = Environment.GetEnvironmentVariable("VALIDATION_ONLY") ?? "";      // developer switch: run one parameter only (name contains)
 
@@ -125,6 +238,7 @@ public class ConfigureInputValidationTest
             return false;
         }
 
+        _scopeRows = rows.GroupBy(r => r.Scope).ToDictionary(g => g.Key, g => g.OrderBy(r => r.ExcelRow).Select(r => r.ExcelRow).ToList());
         var todo = rows.Where(r => (r.Channel == 0 || ValidationChannels.Contains(r.Channel)) && r.Channel <= _unit.Channels
                                    && !NeverChange.Contains(r.Name) && !IsLogicParam(r.Name) && r.Scope != ConfigureNav.GroupScope
                                    && (onlyName.Length == 0 || r.Name.Contains(onlyName, StringComparison.OrdinalIgnoreCase))).ToList();
@@ -135,18 +249,7 @@ public class ConfigureInputValidationTest
         Console.Write("Choice [1]: ");
         _stopOnFail = (Console.ReadLine() ?? "").Trim() != "2";
 
-        RowSelection? selection;
-        while (true)
-        {
-            Console.Write("Excel rows to run (Enter = all;  e.g.  54-70, 72, 100-  ): ");
-            if (RowSelection.TryParse(Console.ReadLine(), out selection, out string selectionError))
-            {
-                break;
-            }
-
-            Console.WriteLine(selectionError);
-        }
-
+        var selection = RowSelection.Ask(FilePrefix, _unit.PartNumber, out _rowsDescription);
         Console.WriteLine();
         if (selection != null)
         {
@@ -154,17 +257,38 @@ public class ConfigureInputValidationTest
         }
 
         _guiVersion = ReadGuiVersion();
+        if (!GuiVersionIsAtLeast(_guiVersion, 2, 1, 2))
+        {
+            _log("WARN  | GUI '" + _guiVersion + "' is older than 2.1.2: this test was developed on 2.1.2 (a refused value leaves a red X + the stored value next to the field and Enter applies the value). Its results on this GUI are NOT validated.");
+        }
+
         _log("START | Configure input validation | unit=" + _unit.Name + " | scope: System + channel(s) " + string.Join(",", ValidationChannels)
              + " | parameters=" + todo.Count + (onlyName.Length > 0 ? " | only names containing '" + onlyName + "'" : "") + " | on failure: " + (_stopOnFail ? "stop" : "continue")
-             + " | rows: " + (selection == null ? "all" : selection.ToString()) + " | NOTHING is saved to flash");
+             + " | rows: " + _rowsDescription + " | NOTHING is saved to flash");
+        if (selection?.SourceFile != null)
+        {
+            _log("INFO  | RE-RUN of the failed rows listed in: " + selection.SourceFile);
+            foreach (var mismatch in selection.NameMismatches(todo.Select(r => (r.ExcelRow, r.Name))))
+            {
+                _log("WARN  | " + mismatch + " - was the master workbook edited since that run?");
+            }
+        }
+
         if (todo.Count == 0)
         {
             _log("FAIL  | no parameter to check");
             return false;
         }
 
+        _todo = todo;
+        _report = new RunReport(FilePrefix, _unit.PartNumber);
+        RunClock.Start();      // the menu's "took" time starts here: the questions above are not counted
+        _log("INFO  | this run's failures file (rewritten after every failure and at the end, also after Ctrl+C or a crash): " + _report.Path);
+        WriteFailuresFile();      // exists from the first minute: status "Running" until the run ends (deleted again if nothing fails)
+
         using var automation = new UIA3Automation();
         var window = AppConnection.Attach(automation);
+        _window = window;
         string? unitProblem = UnitCheck.Verify(window, _unit, _log);
         if (unitProblem != null)
         {
@@ -194,6 +318,7 @@ public class ConfigureInputValidationTest
             foreach (var row in scope)
             {
                 index++;
+                _current = row;
                 _log("DRAW  | " + index + "/" + todo.Count + " | " + row.Label);
                 bool finished;
                 try
@@ -209,15 +334,20 @@ public class ConfigureInputValidationTest
 
                 if (!finished)
                 {
-                    _findings.Add(new Finding(row, "(stuck)", "no hang", "no progress for " + NoProgressMinutes + " min - last action: " + _where, ""));
+                    AddFinding(new Finding(row, "(stuck)", "no hang", "no progress for " + NoProgressMinutes + " min - last action: " + _where, "", "the test got stuck (no progress for " + NoProgressMinutes + " minutes) - " + _where));
                     _log("FAIL  | " + row.Label + " | STEP: " + _where + " | WHY: no progress for " + NoProgressMinutes + " minutes | CHECK: the GUI may be frozen or a UI call is not returning; check the unit and the GUI");
                     _stopRequested = true;
                 }
 
+                _current = null;
+                _finished = index;
                 if (_stopRequested)
                 {
+                    _endStatus = !finished ? "Stopped - stuck (no progress for " + NoProgressMinutes + " minutes)"
+                               : _stopOnFail ? "Stopped after the first failing input"
+                               : "Stopped - " + _failInARow + " failing inputs in a row (unit or GUI problem?)";
                     _log("STOPPED | " + (finished ? "halted after the first failing input" : "the run is stuck and cannot continue safely") + " - remaining parameters were not checked");
-                    _log("RESUME| to continue later answer 'Excel rows to run' with:  " + row.ExcelRow + "-  (this parameter again)");
+                    _log("RESUME| to continue later answer 'Excel rows to run' with:  " + row.ExcelRow + "-  (this parameter again)   or give the failures file (only its failed rows)");
                     goto Summary;
                 }
             }
@@ -225,18 +355,21 @@ public class ConfigureInputValidationTest
 
         Summary:
 
-        _log("DONE  | parameters=" + _params + " skipped=" + _skippedParams + " | inputs checked=" + _inputs + " passed=" + _passed + " findings=" + _findings.Count + " | " + watch.Elapsed.TotalMinutes.ToString("0.0") + " min");
+        _report!.Finish(_endStatus ?? (_findings.Count == 0 ? "Completed - no failures" : "Completed - with failures"));
+        _log("DONE  | parameters=" + _params + " skipped=" + _skippedParams + " | inputs checked=" + _inputs + " passed=" + _passed + " findings=" + _findings.Count + " | " + RunReport.Format(watch.Elapsed) + " | scroll positions tried: " + ConfigureNav.ScrollSteps);
         _log("RESULT| " + new string('=', 90));
         _log("RESULT| " + (_findings.Count == 0 ? "PASSED" : "FAILED") + " | unit=" + _unit.Name + " | inputs checked=" + _inputs + " | failures=" + _findings.Count + " | mode=" + (_stopOnFail ? "stop on fail" : "continue"));
-        foreach (var f in _findings)
+        _log("RESULT| status          : " + _report.Status);
+        _log("RESULT| total run time  : " + RunReport.Format(_report.Elapsed) + "  (" + _report.Started.ToString("HH:mm:ss") + " - " + (_report.Ended ?? DateTime.Now).ToString("HH:mm:ss") + ")");
+        foreach (var g in _findings.GroupBy(x => x.Row.ExcelRow))
         {
-            _log("RESULT|   row " + f.Row.ExcelRow + " | " + f.Row.Label.Split('(')[0].Trim() + " | input " + f.Input + " | expected " + f.Expected + " | GUI: " + f.Actual + (f.GuiLog.Length > 0 ? " | GUI log: " + f.GuiLog : ""));
+            _log("RESULT|   row " + g.Key + " | " + g.First().Row.Label.Split('(')[0].Trim() + " -> " + string.Join("; ", g.Select(x => x.Problem)));
         }
 
         string? file = WriteFailuresFile();
         if (file != null)
         {
-            _log("RESULT| failures file : " + file);
+            _log("RESULT| failures file : " + file + (_findings.Count > 0 ? "   (to re-run only these rows give this file at 'Excel rows to run')" : ""));
         }
 
         _log("RESULT| " + new string('=', 90));
@@ -299,6 +432,7 @@ public class ConfigureInputValidationTest
         else
         {
             inputs.Add(("abc", Expect.Reject, "letters"));
+            inputs.Add(("5abc", Expect.Reject, "digit mixed with letters"));
             inputs.Add(("", Expect.Reject, "empty"));
             if (tip.Min.HasValue && tip.Max.HasValue)
             {
@@ -320,7 +454,17 @@ public class ConfigureInputValidationTest
 
         foreach (var (text, expect, what) in inputs)
         {
-            CheckInput(window, row, original, text, expect, what, tip);
+            // a value that must be ACCEPTED is tried a second time before it counts as a failure (a red X left over from the previous input can look like a rejection)
+            if (expect != Expect.Accept || !CheckInput(window, row, original, text, expect, what, tip, record: false))
+            {
+                if (expect == Expect.Accept)
+                {
+                    _log("NOTE  | " + row.Label + " | " + what + " '" + text + "' was refused - trying once more");
+                }
+
+                CheckInput(window, row, original, text, expect, what, tip);
+            }
+
             if (_stopRequested)
             {
                 break;       // the original value has been put back by CheckInput; the run stops after this parameter
@@ -343,7 +487,8 @@ public class ConfigureInputValidationTest
         }
     }
 
-    private void CheckInput(Window window, Row row, string original, string text, Expect expect, string what, Tip tip)
+    // record=false: a failing result is NOT counted/logged (used for the first try of a value that must be ACCEPTED, which is repeated once); returns whether the result was as expected.
+    private bool CheckInput(Window window, Row row, string original, string text, Expect expect, string what, Tip tip, bool record = true)
     {
         // a red-X chip left over from the previous input would look like a rejection of this one: start from a clean field
         ClearRejection(window, row);
@@ -367,6 +512,23 @@ public class ConfigureInputValidationTest
         };
         string expected = expect switch { Expect.Reject => "REJECTED", Expect.Accept => "ACCEPTED", _ => "REJECTED or cut to Max" };
 
+        if (!ok && !record)
+        {
+            tb = FindValueElement(window, row) ?? tb;
+            if (chip)
+            {
+                ClearRejection(window, row);
+            }
+            else
+            {
+                TypeAndEnter(tb, original);
+                WaitForRejectChipGone(window, row, 3000);
+                ClearRejection(window, row);
+            }
+
+            return false;
+        }
+
         _inputs++;
         string shownText = text.Length > 20 ? text.Substring(0, 20) + "...(" + text.Length + ")" : text;
         if (ok)
@@ -378,7 +540,7 @@ public class ConfigureInputValidationTest
         {
             _log("FAIL  | " + row.Label + " | " + what + " '" + shownText + "' | expected " + expected + " | " + actual + (guiLog.Length > 0 ? " | GUI log: " + guiLog : "")
                  + (expect == Expect.Reject && accepted ? " | THE UNIT HELD THIS INVALID VALUE until it was put back" : ""));
-            _findings.Add(new Finding(row, what + " '" + shownText + "'", expected, actual, guiLog));
+            AddFinding(new Finding(row, what + " '" + shownText + "'", expected, actual, guiLog, Problem(what, text, expect, expected, actual)));
             _failInARow++;
             if (_stopOnFail || _failInARow >= MaxFailuresInARow)
             {
@@ -399,7 +561,33 @@ public class ConfigureInputValidationTest
         // clears the red X, ~0.5 s) is enough; after an accepted value the unit holds the typed value, so the original is typed back.
         if (chip)
         {
-            ClearRejection(window, row);
+            ClearRejection(window, row);      // the row refresh reads the value from the UNIT
+            if (expect != Expect.Accept)
+            {
+                // the unit must still hold the original after the refusal - it must never keep the invalid value
+                string held = "";
+                for (int i = 0; i < 8; i++)
+                {
+                    var again = FindValueElement(window, row);
+                    held = again == null ? "" : DisplayedValue(window, row, again);
+                    if (SameValue(held, original))
+                    {
+                        break;
+                    }
+
+                    Thread.Sleep(200);
+                }
+
+                if (!SameValue(held, original) && held.Length > 0)
+                {
+                    string shownHeld = held.Length > 20 ? held.Substring(0, 20) + "..." : held;
+                    _log("FAIL  | " + row.Label + " | " + what + " '" + shownText + "' | after the refusal the UNIT holds '" + shownHeld + "' instead of the original '" + original + "'");
+                    AddFinding(new Finding(row, what + " '" + shownText + "'", "the unit keeps '" + original + "'", "unit holds '" + shownHeld + "'", guiLog, "the unit holds '" + shownHeld + "' after the value was refused (original '" + original + "')"));
+                    _stopRequested |= _stopOnFail;
+                    TypeAndEnter(FindValueElement(window, row) ?? tb, original);      // put the original back
+                    WaitForRejectChipGone(window, row, 3000);
+                }
+            }
         }
         else
         {
@@ -408,6 +596,8 @@ public class ConfigureInputValidationTest
             WaitForRejectChipGone(window, row, 3000);
             ClearRejection(window, row);
         }
+
+        return ok;
     }
 
     // The red X stays until the row is refreshed: press the row's "Refresh parameter value from unit" button (id = name id + "Refresh").
@@ -437,6 +627,23 @@ public class ConfigureInputValidationTest
 
     // ------------------------------------------------------------------ GUI helpers
 
+    // The failure in plain words, as it appears in the Failures workbook ("does not accept Min (0)", "accepts a value above Max (26)", ...).
+    private static string Problem(string what, string text, Expect expect, string expected, string actual)
+    {
+        string shown = text.Length > 20 ? text.Substring(0, 20) + "..." : text;
+        if (what.StartsWith("Max (", StringComparison.Ordinal)) return "does not accept Max (" + shown + ")";
+        if (what.StartsWith("Min (", StringComparison.Ordinal)) return "does not accept Min (" + shown + ")";
+        if (what == "Max+1") return "accepts a value above Max (" + shown + ")";
+        if (what == "Min-1") return "accepts a value below Min (" + shown + ")";
+        if (what == "letters") return "accepts letters ('" + shown + "')";
+        if (what == "digit mixed with letters") return "accepts a digit mixed with letters ('" + shown + "')";
+        if (what == "empty") return "accepts an empty value";
+        if (what == "Hebrew letters") return "accepts Hebrew letters";
+        if (what.StartsWith("Max+1 characters", StringComparison.Ordinal)) return "accepts text longer than the maximum (" + text.Length + " characters)";
+        if (what.StartsWith("English letters", StringComparison.Ordinal)) return "does not accept valid text (English letters, digit, space, symbols)";
+        return what + " - expected " + expected + ", GUI: " + actual;
+    }
+
     private static bool SameText(string a, string b)
     {
         if (double.TryParse(a, NumberStyles.Float, CultureInfo.InvariantCulture, out double x) && double.TryParse(b, NumberStyles.Float, CultureInfo.InvariantCulture, out double y))
@@ -451,6 +658,12 @@ public class ConfigureInputValidationTest
 
     private void TypeAndEnter(AutomationElement tb, string text)
     {
+        // the keystrokes go to the FRONT window - it must be the GUI
+        if (_window != null && !AppConnection.EnsureGuiInFront(_window))
+        {
+            throw new InvalidOperationException("Power Rider Studio is not the front window (the keystrokes would go to another window) and could not be brought forward");
+        }
+
         try
         {
             tb.Focus();
@@ -580,31 +793,26 @@ public class ConfigureInputValidationTest
         var scroll = list.Patterns.Scroll.PatternOrDefault;
         bool scrollable = scroll != null && scroll.VerticallyScrollable.ValueOrDefault;
         double view = scrollable ? Math.Max(5, scroll!.VerticalViewSize.ValueOrDefault) : 100;
-        double start = _lastPct.TryGetValue(row.Scope, out double last) ? Math.Max(0, last - view / 2) : 0;
-        foreach (double from in new[] { start, 0 })
+        double estimate = _scopeRows.TryGetValue(row.Scope, out var rowsOfScope)
+            ? ConfigureNav.EstimateScrollPercent(rowsOfScope.Count, rowsOfScope.IndexOf(row.ExcelRow), view) : -1;
+        double lastPct = _lastPct.TryGetValue(row.Scope, out double lp) ? lp : -1;
+        foreach (double pct in ConfigureNav.ScrollTries(estimate, lastPct, view))
         {
-            for (double pct = from; ; pct += view / 2)
+            if (scrollable)
             {
-                if (scrollable)
-                {
-                    scroll!.SetScrollPercent(-1, Math.Min(pct, 100));
-                    Thread.Sleep(150);
-                }
-
-                var el = list.FindFirstDescendant(cf => cf.ByAutomationId(row.ValueId));
-                if (el != null)
-                {
-                    _lastPct[row.Scope] = Math.Min(pct, 100);
-                    return el;
-                }
-
-                if (!scrollable || pct >= 100)
-                {
-                    break;
-                }
+                ConfigureNav.ScrollSteps++;
+                scroll!.SetScrollPercent(-1, pct);
+                Thread.Sleep(150);
             }
 
-            if (start == 0)
+            var el = list.FindFirstDescendant(cf => cf.ByAutomationId(row.ValueId));
+            if (el != null)
+            {
+                _lastPct[row.Scope] = pct;
+                return el;
+            }
+
+            if (!scrollable)
             {
                 break;
             }
@@ -794,52 +1002,101 @@ public class ConfigureInputValidationTest
         }
     }
 
-    // One row per failing input (Excel row first): Failures\InputValidation_<PN>_<time>.xlsx next to the log files.
+    // One line per failing INPUT (Excel row first - give this file at 'Excel rows to run' to run only these parameters again), each with WHY it failed in
+    // plain words ("does not accept Min (0)", "accepts a value above Max (26)", ...), so every range problem of a parameter is listed, not only the first.
+    // Failures\InputValidation_<PN>_<run start>.xlsx next to the log files. Sheets: Failed, Run (status / time), Not run (rows never reached).
+    // Called after every failing input and at the end, whatever the end is. Written when something failed or the run did not complete normally.
     private string? WriteFailuresFile()
     {
-        if (_findings.Count == 0)
+        var report = _report;
+        if (report == null)
         {
             return null;
         }
 
         try
         {
-            string dir = Path.Combine(AppContext.BaseDirectory, "Failures");
-            Directory.CreateDirectory(dir);
-            string path = Path.Combine(dir, "InputValidation_" + _unit.PartNumber + "_" + DateTime.Now.ToString("yyyyMMdd_HHmmss") + ".xlsx");
-            using var wb = new XLWorkbook();
-            var ws = wb.AddWorksheet("Failed");
-            string[] headers = { "Excel row", "Channel", "Parameter", "Input", "Expected", "GUI result", "GUI log", "Unit", "GUI version", "Run time" };
-            for (int i = 0; i < headers.Length; i++)
+            lock (report.Sync)
             {
-                ws.Cell(1, i + 1).Value = headers[i];
-                ws.Cell(1, i + 1).Style.Font.Bold = true;
-            }
+                if (report.Finished && _findings.Count == 0 && report.Status.StartsWith("Completed", StringComparison.Ordinal))
+                {
+                    try { File.Delete(report.Path); } catch { /* the "running" version written at the start - nothing failed, nothing to keep */ }
+                    return null;
+                }
 
-            int r = 2;
-            foreach (var f in _findings)
-            {
-                ws.Cell(r, 1).Value = f.Row.ExcelRow;
-                ws.Cell(r, 2).Value = f.Row.Channel > 0 ? f.Row.Channel.ToString() : "System";
-                ws.Cell(r, 3).Value = f.Row.Name;
-                ws.Cell(r, 4).Value = f.Input;
-                ws.Cell(r, 5).Value = f.Expected;
-                ws.Cell(r, 6).Value = f.Actual;
-                ws.Cell(r, 7).Value = f.GuiLog.Length > 200 ? f.GuiLog.Substring(0, 200) + "..." : f.GuiLog;
-                ws.Cell(r, 8).Value = _unit.Name;
-                ws.Cell(r, 9).Value = _guiVersion;
-                ws.Cell(r, 10).Value = DateTime.Now.ToString("yyyy-MM-dd HH:mm");
-                r++;
-            }
+                using var wb = new XLWorkbook();
+                var ws = wb.AddWorksheet(RunReport.SheetFailed);
+                string[] head = { "Excel row", "Channel", "Parameter", "Why it failed", "Input typed", "Expected", "GUI result", "GUI log", "Unit", "GUI version", "Run time" };
+                for (int i = 0; i < head.Length; i++)
+                {
+                    ws.Cell(1, i + 1).Value = head[i];
+                    ws.Cell(1, i + 1).Style.Font.Bold = true;
+                }
 
-            ws.Columns().AdjustToContents();
-            wb.SaveAs(path);
-            return path;
+                int r = 2;
+                foreach (var f in _findings)
+                {
+                    ws.Cell(r, 1).Value = f.Row.ExcelRow;
+                    ws.Cell(r, 2).Value = f.Row.Channel > 0 ? f.Row.Channel.ToString() : "System";
+                    ws.Cell(r, 3).Value = f.Row.Name;
+                    ws.Cell(r, 4).Value = f.Problem;
+                    ws.Cell(r, 5).Value = f.Input;
+                    ws.Cell(r, 6).Value = f.Expected;
+                    ws.Cell(r, 7).Value = f.Actual;
+                    ws.Cell(r, 8).Value = f.GuiLog.Length > 200 ? f.GuiLog.Substring(0, 200) + "..." : f.GuiLog;
+                    ws.Cell(r, 9).Value = _unit.Name;
+                    ws.Cell(r, 10).Value = _guiVersion;
+                    ws.Cell(r, 11).Value = DateTime.Now.ToString("yyyy-MM-dd HH:mm");
+                    r++;
+                }
+
+                ws.Columns().AdjustToContents();
+
+                // parameters of this run that were never reached (a finished run has none; a stopped one lists where to go on)
+                var failedRows = new HashSet<int>(_findings.Select(f => f.Row.ExcelRow));
+                var notRun = _todo.Skip(_finished).Where(x => !failedRows.Contains(x.ExcelRow))
+                                  .Select(x => (x.ExcelRow, x.Channel > 0 ? x.Channel.ToString() : "System", x.Name)).ToList();
+                report.AddRunSheet(wb, new[]
+                {
+                    ("Test", "Configure - input validation"),
+                    ("Unit", _unit.Name),
+                    ("GUI version", _guiVersion),
+                    ("On failure", _stopOnFail ? "stop at the first failure" : "continue"),
+                    ("Rows of this run", _rowsDescription),
+                    ("Parameters in this run", _todo.Count.ToString()),
+                    ("Inputs checked / passed / failed", _inputs + " / " + _passed + " / " + _findings.Count),
+                    ("Not reached", notRun.Count.ToString()),
+                });
+                RunReport.AddNotRunSheet(wb, notRun);
+                report.Save(wb);
+                return report.Path;
+            }
         }
         catch (Exception ex)
         {
             _log("WARN  | could not write the failures file: " + ex.Message);
             return null;
         }
+    }
+
+    private static bool GuiVersionIsAtLeast(string version, int major, int minor, int patch)
+    {
+        var m = Regex.Match(version ?? "", @"^(\d+)\.(\d+)\.(\d+)");
+        if (!m.Success)
+        {
+            return true;       // unknown format: do not block
+        }
+
+        int[] v = { int.Parse(m.Groups[1].Value), int.Parse(m.Groups[2].Value), int.Parse(m.Groups[3].Value) };
+        int[] need = { major, minor, patch };
+        for (int i = 0; i < 3; i++)
+        {
+            if (v[i] != need[i])
+            {
+                return v[i] > need[i];
+            }
+        }
+
+        return true;
     }
 }

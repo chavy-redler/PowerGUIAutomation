@@ -49,6 +49,7 @@ public class DebugCompareSubsetTest
             }
         }
 
+        RunClock.Start();      // the menu's "took" time starts after the questions
         _log("START | Debug run | unit=" + _unit.Name + " | channels=" + (channels == null ? "all" : string.Join(",", channels.OrderBy(x => x).Select(x => x == 0 ? "System" : x.ToString())))
              + " | name contains='" + nameText + "'");
 

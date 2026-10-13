@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Runtime.InteropServices;
 using System.Threading;
 using FlaUI.Core;
 using FlaUI.Core.AutomationElements;
@@ -11,6 +12,56 @@ namespace PowerGUIAutomation;
 // copy-pasted per test.
 public static class AppConnection
 {
+    [DllImport("user32.dll")]
+    private static extern IntPtr GetForegroundWindow();
+
+    [DllImport("user32.dll")]
+    private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
+
+    private static int _guiProcessId;
+
+    // Keyboard input (paste, Enter) goes to the window that is in FRONT. At the start of a run that is the console, so the GUI is brought forward here and
+    // re-checked before every typed input (two Win32 calls, no UIA - practically free).
+    public static bool IsGuiInFront()
+    {
+        GetWindowThreadProcessId(GetForegroundWindow(), out uint pid);
+        return _guiProcessId != 0 && pid == (uint)_guiProcessId;
+    }
+
+    public static bool EnsureGuiInFront(Window window)
+    {
+        if (IsGuiInFront())
+        {
+            return true;
+        }
+
+        try
+        {
+            var pattern = window.Patterns.Window.PatternOrDefault;
+            if (pattern != null && pattern.WindowVisualState.ValueOrDefault == FlaUI.Core.Definitions.WindowVisualState.Minimized)
+            {
+                pattern.SetWindowVisualState(FlaUI.Core.Definitions.WindowVisualState.Normal);
+            }
+
+            window.SetForeground();
+        }
+        catch
+        {
+            // checked below
+        }
+
+        for (int i = 0; i < 8; i++)
+        {
+            Thread.Sleep(100);
+            if (IsGuiInFront())
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     public static Window Attach(UIA3Automation automation)
     {
         var processes = Process.GetProcessesByName("PowerRiderStudio");
@@ -20,7 +71,10 @@ public static class AppConnection
         }
 
         var app = Application.Attach(processes[0]);
-        return app.GetMainWindow(automation);
+        _guiProcessId = processes[0].Id;
+        var window = app.GetMainWindow(automation);
+        EnsureGuiInFront(window);       // the console is in front when a test starts
+        return window;
     }
 
     public static void GoToTab(Window mainWindow, string tabAutomationId)

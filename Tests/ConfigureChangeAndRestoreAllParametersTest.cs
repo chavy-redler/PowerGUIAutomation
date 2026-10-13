@@ -31,7 +31,7 @@ namespace PowerGUIAutomation.Tests;
 // and parameters with no range and no unit rule.
 //
 // SAFETY: this test WRITES parameters to the connected unit and saves them to flash (Reset Unit only if DoReset is on). There is no
-// confirmation question here; the only prompt is the "unit was reset to default?" check of the main menu (Program.cs).
+// confirmation question; the "Before test 3" frame of the main menu (TestInstructions.cs) tells the user to reset the unit to default first.
 public class ConfigureChangeAndRestoreAllParametersTest
 {
     private const int MaxFindRetries = 12;
@@ -62,6 +62,7 @@ public class ConfigureChangeAndRestoreAllParametersTest
     private string _failParam = "", _failStep = "", _failWhy = "", _failCheck = "";
     private string _guiVersion = "";
     private readonly Dictionary<int, double> _lastPct = new();      // per scope: scroll position where the previous parameter was found
+    private Dictionary<int, List<int>> _scopeRows = new();           // per scope: the Excel rows in list order (position of a row in the page = its index here)
 
     private AutomationElement? _logElement;
 
@@ -73,6 +74,7 @@ public class ConfigureChangeAndRestoreAllParametersTest
     }
 
     private string[] Sheets => new[] { _unit.ParameterSheet };
+    private bool _guiSaveNoteShown;
 
     // "stop on fail" (default) halts at the first failure; "continue" goes on with the next parameter and lists every failure at the end
     // (log + a workbook in the Failures folder next to the logs).
@@ -122,6 +124,64 @@ public class ConfigureChangeAndRestoreAllParametersTest
     private readonly List<FailedParam> _failures = new();
     private string _curStep = "", _curWhy = "";      // first failure of the parameter that is being tested
 
+    // The failures workbook of THIS run (fixed name, rewritten after every failure and at the end - see RunReport) and what it needs to say about
+    // a run that did not reach its end: the parameters of the run, how many are finished, and the one that is being tested right now.
+    private const string FilePrefix = "ChangeAndRestore";
+    private RunReport? _report;
+    private List<Param> _todo = new();
+    private int _finished;
+    private Param? _current;
+    private string _rowsDescription = "all";
+    private int _checked, _passedCount, _skippedCount;
+
+    // Recorded under the report's lock: the Ctrl+C / console-close handler writes the workbook from another thread.
+    private void AddFailure(FailedParam f)
+    {
+        if (_report == null)
+        {
+            _failures.Add(f);
+            return;
+        }
+
+        lock (_report.Sync)
+        {
+            _failures.Add(f);
+        }
+
+        WriteFailuresFile();      // the file is current after every failure, not only at the end of a (possibly hours long) run
+    }
+
+    // Ctrl+C or closing the console: the run ends here, so the file must say so. The parameter that was being tested is listed as failed -
+    // it may have been left on a changed value on the unit (the test did not get to restore it).
+    private void Interrupted(string status)
+    {
+        var report = _report;
+        if (report == null)
+        {
+            return;
+        }
+
+        lock (report.Sync)
+        {
+            if (report.Finished)
+            {
+                return;
+            }
+
+            if (_current != null)
+            {
+                _failures.Add(new FailedParam(_current, "interrupted", "the run was stopped while this parameter was being changed or restored - its value on the unit is UNKNOWN, check it", false));
+            }
+
+            report.Finish(status);
+        }
+
+        _log("STOPPED | " + status + (_current != null ? " | interrupted while testing: " + _current.Label + " - check this parameter on the unit" : ""));
+        WriteFailuresFile();
+        _log("RESULT| run time        : " + RunReport.Format(report.Elapsed));
+        _log("RESULT| failures file   : " + report.Path);
+    }
+
     // ------------------------------------------------------------------ model
 
     private sealed class Param
@@ -162,11 +222,25 @@ public class ConfigureChangeAndRestoreAllParametersTest
         }
     }
 
-    private void LogResult(bool passed, int done, int passedCount, bool restored, int skipped)
+    // 'status' = how the run ended, for the log and the Run sheet of the failures file; the default covers the usual endings.
+    private void LogResult(bool passed, int done, int passedCount, bool restored, int skipped, string? status = null)
     {
+        _checked = done;
+        _passedCount = passedCount;
+        _skippedCount = skipped;
+        status ??= passed ? "Completed - no failures"
+                 : done == 0 ? "Test setup failed - nothing was checked"
+                 : _stopOnFail ? "Stopped after the first failure" : "Completed - with failures";
+        _report?.Finish(status);
         _log("RESULT| " + new string('=', 90));
         _log("RESULT| " + (passed ? "PASSED" : "FAILED") + " | unit=" + _unit.Name + " | parameters changed+restored=" + passedCount + " of " + done + " checked | failed=" + _failures.Count + " | skipped=" + skipped
              + " | mode=" + (_stopOnFail ? "stop on fail" : "continue"));
+        _log("RESULT| status          : " + status);
+        if (_report != null)
+        {
+            _log("RESULT| total run time  : " + RunReport.Format(_report.Elapsed) + "  (" + _report.Started.ToString("HH:mm:ss") + " - " + (_report.Ended ?? DateTime.Now).ToString("HH:mm:ss") + ")");
+        }
+
         if (!passed && _stopOnFail && _failStep.Length > 0)
         {
             _log("RESULT| failed parameter : " + _failParam);
@@ -190,7 +264,7 @@ public class ConfigureChangeAndRestoreAllParametersTest
         string? file = WriteFailuresFile();
         if (file != null)
         {
-            _log("RESULT| failures file : " + file);
+            _log("RESULT| failures file : " + file + (_failures.Count > 0 ? "   (to re-run only these rows give this file at 'Excel rows to run')" : ""));
         }
 
         _log("RESULT| " + new string('=', 90));
@@ -198,47 +272,73 @@ public class ConfigureChangeAndRestoreAllParametersTest
 
     private static string Short(string text, int max) => text.Length <= max ? text : text.Substring(0, max) + "...";
 
-    // One row per failed parameter (Excel row first, so a later run can take its parameters from this file): Failures\ChangeAndRestore_<PN>_<time>.xlsx
-    // next to the log files.
+    // One row per failed parameter (Excel row first, so a later run can take its parameters from this file - give the file at 'Excel rows to run'):
+    // Failures\ChangeAndRestore_<PN>_<run start>.xlsx next to the log files. Sheets: Failed, Run (status / time), Not run (rows never reached).
+    // Called after every failure and at the end, whatever the end is. Written when something failed or the run did not complete normally.
     private string? WriteFailuresFile()
     {
-        if (_failures.Count == 0)
+        var report = _report;
+        if (report == null)
         {
             return null;
         }
 
         try
         {
-            string dir = Path.Combine(AppContext.BaseDirectory, "Failures");
-            Directory.CreateDirectory(dir);
-            string path = Path.Combine(dir, "ChangeAndRestore_" + _unit.PartNumber + "_" + DateTime.Now.ToString("yyyyMMdd_HHmmss") + ".xlsx");
-            using var wb = new XLWorkbook();
-            var ws = wb.AddWorksheet("Failed");
-            string[] headers = { "Excel row", "Channel", "Parameter", "Failed step", "Reason", "Default restored", "Unit", "GUI version", "Run time" };
-            for (int i = 0; i < headers.Length; i++)
+            lock (report.Sync)
             {
-                ws.Cell(1, i + 1).Value = headers[i];
-                ws.Cell(1, i + 1).Style.Font.Bold = true;
-            }
+                bool normalEnd = report.Finished && _failures.Count == 0 && report.Status.StartsWith("Completed", StringComparison.Ordinal);
+                if (normalEnd)
+                {
+                    try { File.Delete(report.Path); } catch { /* the "running" version written at the start - nothing failed, nothing to keep */ }
+                    return null;
+                }
 
-            int r = 2;
-            foreach (var f in _failures)
-            {
-                ws.Cell(r, 1).Value = f.P.ExcelRow;
-                ws.Cell(r, 2).Value = f.P.Channel > 0 ? f.P.Channel.ToString() : "System";
-                ws.Cell(r, 3).Value = f.P.Name;
-                ws.Cell(r, 4).Value = f.Step;
-                ws.Cell(r, 5).Value = Short(f.Why, 300);
-                ws.Cell(r, 6).Value = f.Restored ? "yes" : "NO";
-                ws.Cell(r, 7).Value = _unit.Name;
-                ws.Cell(r, 8).Value = _guiVersion;
-                ws.Cell(r, 9).Value = DateTime.Now.ToString("yyyy-MM-dd HH:mm");
-                r++;
-            }
+                using var wb = new XLWorkbook();
+                var ws = wb.AddWorksheet(RunReport.SheetFailed);
+                string[] headers = { "Excel row", "Channel", "Parameter", "Why it failed", "Failed step", "Default restored", "Unit", "GUI version", "Run time" };
+                for (int i = 0; i < headers.Length; i++)
+                {
+                    ws.Cell(1, i + 1).Value = headers[i];
+                    ws.Cell(1, i + 1).Style.Font.Bold = true;
+                }
 
-            ws.Columns().AdjustToContents();
-            wb.SaveAs(path);
-            return path;
+                int r = 2;
+                foreach (var f in _failures)
+                {
+                    ws.Cell(r, 1).Value = f.P.ExcelRow;
+                    ws.Cell(r, 2).Value = f.P.Channel > 0 ? f.P.Channel.ToString() : "System";
+                    ws.Cell(r, 3).Value = f.P.Name;
+                    ws.Cell(r, 4).Value = Short(f.Why, 300);
+                    ws.Cell(r, 5).Value = f.Step;
+                    ws.Cell(r, 6).Value = f.Restored ? "yes" : "NO";
+                    ws.Cell(r, 7).Value = _unit.Name;
+                    ws.Cell(r, 8).Value = _guiVersion;
+                    ws.Cell(r, 9).Value = DateTime.Now.ToString("yyyy-MM-dd HH:mm");
+                    r++;
+                }
+
+                ws.Columns().AdjustToContents();
+
+                // parameters of this run that were never reached (a finished run has none; a stopped one lists where to go on)
+                var failedRows = new HashSet<int>(_failures.Select(f => f.P.ExcelRow));
+                var notRun = _todo.Skip(_finished).Where(p => !failedRows.Contains(p.ExcelRow))
+                                  .Select(p => (p.ExcelRow, p.Channel > 0 ? p.Channel.ToString() : "System", p.Name)).ToList();
+                report.AddRunSheet(wb, new[]
+                {
+                    ("Test", "Configure - change and restore every parameter"),
+                    ("Unit", _unit.Name),
+                    ("GUI version", _guiVersion),
+                    ("On failure", _stopOnFail ? "stop at the first failure" : "continue"),
+                    ("Rows of this run", _rowsDescription),
+                    ("Parameters in this run", _todo.Count.ToString()),
+                    ("Checked / passed / skipped / failed", _checked + " / " + _passedCount + " / " + _skippedCount + " / " + _failures.Count),
+                    ("Not reached", notRun.Count.ToString()),
+                });
+                RunReport.AddNotRunSheet(wb, notRun);
+                report.Save(wb);
+                return report.Path;
+            }
         }
         catch (Exception ex)
         {
@@ -249,7 +349,44 @@ public class ConfigureChangeAndRestoreAllParametersTest
 
     // ------------------------------------------------------------------ entry point
 
+    // The run is wrapped so that Ctrl+C, closing the console and a crash all leave the failures file with the right status (see Interrupted).
     public bool Run()
+    {
+        ConsoleCancelEventHandler onCancel = (_, _) => Interrupted("Stopped by the user (Ctrl+C)");
+        EventHandler onExit = (_, _) => Interrupted("Stopped - the console was closed or the program was ended");
+        Console.CancelKeyPress += onCancel;
+        AppDomain.CurrentDomain.ProcessExit += onExit;
+        try
+        {
+            return RunCore();
+        }
+        catch (Exception ex)
+        {
+            if (_report != null && !_report.Finished)
+            {
+                // an exception that nothing caught: "test failed" in the middle - the file says so and names the parameter that was being tested
+                if (_current != null)
+                {
+                    lock (_report.Sync)
+                    {
+                        _failures.Add(new FailedParam(_current, "unexpected error", ex.GetType().Name + ": " + ex.Message + " - the value on the unit is UNKNOWN, check it", false));
+                    }
+                }
+
+                _log("FAIL  | the test crashed: " + ex.GetType().Name + ": " + ex.Message);
+                LogResult(false, _checked, _passedCount, false, _skippedCount, "Test failed - crashed: " + ex.GetType().Name + ": " + Short(ex.Message, 120));
+            }
+
+            throw;
+        }
+        finally
+        {
+            Console.CancelKeyPress -= onCancel;
+            AppDomain.CurrentDomain.ProcessExit -= onExit;
+        }
+    }
+
+    private bool RunCore()
     {
         _guiVersion = ReadGuiVersion();
         if (_guiVersion.Length == 0)
@@ -270,22 +407,20 @@ public class ConfigureChangeAndRestoreAllParametersTest
         Console.Write("Choice [1]: ");
         _stopOnFail = (Console.ReadLine() ?? "").Trim() != "2";
 
-        RowSelection? selection;
-        while (true)
-        {
-            Console.Write("Excel rows to run (Enter = all;  e.g.  54-70, 72, 100-  ): ");
-            if (RowSelection.TryParse(Console.ReadLine(), out selection, out string selectionError))
-            {
-                break;
-            }
-
-            Console.WriteLine(selectionError);
-        }
-
+        var selection = RowSelection.Ask(FilePrefix, _unit.PartNumber, out _rowsDescription);
         Console.WriteLine();
 
+        _report = new RunReport(FilePrefix, _unit.PartNumber);
+        RunClock.Start();      // the menu's "took" time starts here: the questions above are not counted
         _log("START | Configure change-and-restore test | unit=" + _unit.Name + " (sheet '" + _unit.ParameterSheet + "') | GUI version=" + _guiVersion
-             + " | on failure: " + (_stopOnFail ? "stop" : "continue") + " | rows: " + (selection == null ? "all" : selection.ToString()));
+             + " | on failure: " + (_stopOnFail ? "stop" : "continue") + " | rows: " + _rowsDescription);
+        if (selection?.SourceFile != null)
+        {
+            _log("INFO  | RE-RUN of the failed rows listed in: " + selection.SourceFile);
+        }
+
+        _log("INFO  | this run's failures file (rewritten after every failure and at the end, also after Ctrl+C or a crash): " + _report.Path);
+        WriteFailuresFile();      // exists from the first minute: status "Running" until the run ends (deleted again if nothing fails)
 
         List<Param> all;
         try
@@ -309,6 +444,7 @@ public class ConfigureChangeAndRestoreAllParametersTest
         }
 
         all = all.Where(p => p.Channel <= _unit.Channels).ToList();      // a 12-channel unit has no channel 13..16
+        _scopeRows = all.GroupBy(p => p.Scope).ToDictionary(g => g.Key, g => g.OrderBy(p => p.ExcelRow).Select(p => p.ExcelRow).ToList());
         var excluded = all.Where(NotChanged).ToList();
         var todo = all.Where(p => !NotChanged(p)).ToList();
         _log("INFO  | parameters in Excel=" + all.Count + " | never changed (baud rates, addresses, logic, group control)=" + excluded.Count + " | to check in this run=" + todo.Count);
@@ -316,7 +452,13 @@ public class ConfigureChangeAndRestoreAllParametersTest
         {
             todo = todo.Where(p => selection.Contains(p.ExcelRow)).ToList();
             _log("INFO  | row selection '" + selection + "': " + todo.Count + " parameter(s) (rows of parameters that are never changed are ignored)");
+            foreach (var mismatch in selection.NameMismatches(todo.Select(p => (p.ExcelRow, p.Name))))
+            {
+                _log("WARN  | " + mismatch + " - was the master workbook edited since that run?");
+            }
         }
+
+        _todo = todo;
 
         if (todo.Count == 0)
         {
@@ -336,7 +478,7 @@ public class ConfigureChangeAndRestoreAllParametersTest
         }
 
         AppConnection.GoToTab(window, "ConfigureTab");
-        if (!WaitFetchDone(window, 300000, "Configure tab just opened"))
+        if (!WaitFetchDone(window, 300000, "Configure tab just opened", quick: false))
         {
             Fail(null, "open the Configure tab", "the GUI kept 'Fetching parameters...' for more than 5 minutes", "is the unit connected and responding? (status bar shows BUS CONFLICT?)");
             LogResult(false, 0, 0, true, 0);
@@ -359,6 +501,7 @@ public class ConfigureChangeAndRestoreAllParametersTest
         foreach (var p in todo)
         {
             index++;
+            _current = p;
             _log("DRAW  | " + index + "/" + todo.Count + " | " + p.Label);
             Outcome outcome;
             bool stuck = false;
@@ -377,13 +520,17 @@ public class ConfigureChangeAndRestoreAllParametersTest
             {
                 Fail(p, "stuck", "no progress for " + NoProgressMinutes + " minutes - last action: " + _where, "the GUI may be frozen or a UI call is not returning; look at the GUI, restart it if needed and run again from this row");
                 _lastRestored = false;
+                _current = null;
+                _finished = index;
                 _failures.Add(new FailedParam(p, _curStep, _curWhy, false));
                 _log("STOPPED | the run is stuck and cannot continue safely");
-                _log("RESUME| to continue later answer 'Excel rows to run' with:  " + p.ExcelRow + "-  (after checking this parameter on the unit)");
-                LogResult(false, done + 1, passed, false, skipped);
+                _log("RESUME| to continue later answer 'Excel rows to run' with:  " + p.ExcelRow + "-  (after checking this parameter on the unit)   or give the failures file (only its failed rows)");
+                LogResult(false, done + 1, passed, false, skipped, "Stopped - stuck (no progress for " + NoProgressMinutes + " minutes)");
                 return false;
             }
 
+            _current = null;
+            _finished = index;
             if (outcome == Outcome.Skipped)
             {
                 skipped++;
@@ -393,7 +540,7 @@ public class ConfigureChangeAndRestoreAllParametersTest
             done++;
             if (outcome == Outcome.Failed)
             {
-                _failures.Add(new FailedParam(p, _curStep, _curWhy, _lastRestored));
+                AddFailure(new FailedParam(p, _curStep, _curWhy, _lastRestored));
                 inARow++;
                 if (_stopOnFail)
                 {
@@ -411,7 +558,7 @@ public class ConfigureChangeAndRestoreAllParametersTest
                 {
                     _log("STOPPED | " + inARow + " parameters failed in a row - that looks like a problem with the unit or the GUI, not with the parameters");
                     ClearSearch(window);
-                    LogResult(false, done, passed, _lastRestored, skipped);
+                    LogResult(false, done, passed, _lastRestored, skipped, "Stopped - " + inARow + " parameters failed in a row (unit or GUI problem?)");
                     return false;
                 }
 
@@ -423,7 +570,8 @@ public class ConfigureChangeAndRestoreAllParametersTest
         }
 
         ClearSearch(window);
-        _log("DONE  | checked=" + done + " passed=" + passed + " failed=" + _failures.Count + " skipped=" + skipped + " | " + watch.Elapsed.TotalMinutes.ToString("0.0") + " min");
+        _log("DONE  | checked=" + done + " passed=" + passed + " failed=" + _failures.Count + " skipped=" + skipped + " | " + RunReport.Format(watch.Elapsed)
+             + " | tree pages selected: " + ConfigureNav.SelectScopeCalls + " | scroll positions tried: " + ConfigureNav.ScrollSteps);
         LogResult(_failures.Count == 0, done, passed, true, skipped);
         return _failures.Count == 0;
     }
@@ -467,69 +615,143 @@ public class ConfigureChangeAndRestoreAllParametersTest
         return Locate(window, search, p, refresh);
     }
 
-    private (AutomationElement? name, AutomationElement? value) LocateOnPage(Window window, Param p)
+    // Fast path of the locate: the parameter's row is already visible on the right page (the same row after Save / refresh, or the next row of the list).
+    // The breadcrumb proves the page (ids repeat in every channel), the search box must be empty.
+    private (AutomationElement? name, AutomationElement? value) TryFindVisible(Window window, Param p)
     {
         try
         {
-            string? crumb = ConfigureNav.SelectScope(window, p.Scope);      // re-selecting rebuilds the list (also after Save/Fetch)
+            var list = window.FindFirstDescendant(cf => cf.ByAutomationId("ParametersList"));
+            var nameEl = list?.FindFirstDescendant(cf => cf.ByAutomationId(p.NameId));
+            var valueEl = list?.FindFirstDescendant(cf => cf.ByAutomationId(p.ValueId));
+            if (nameEl == null || valueEl == null || (nameEl.Name ?? "").Trim() != p.Name || nameEl.Properties.IsOffscreen.ValueOrDefault || valueEl.BoundingRectangle.Width <= 0)
+            {
+                return (null, null);
+            }
+
+            var box = window.FindFirstDescendant(cf => cf.ByAutomationId("searchTextBox"));
+            if (box != null && box.Patterns.Value.TryGetPattern(out var vp) && (vp.Value.ValueOrDefault ?? "").Length > 0)
+            {
+                return (null, null);
+            }
+
+            string crumb = ConfigureNav.ReadBreadcrumb(window);
+            bool scopeOk = p.Scope == ConfigureNav.GroupScope ? crumb.Contains("Group Channel Control", StringComparison.Ordinal)
+                : p.Scope > 0 ? crumb.Contains("Channel " + p.Scope + " Parameters", StringComparison.Ordinal)
+                : crumb.Contains("System Parameters", StringComparison.Ordinal) && !crumb.Contains("Channel", StringComparison.Ordinal);
+            return scopeOk ? (nameEl, valueEl) : (null, null);
+        }
+        catch (Exception ex) when (ex is FlaUI.Core.Exceptions.PropertyNotSupportedException or FlaUI.Core.Exceptions.ElementNotAvailableException or System.Runtime.InteropServices.COMException or InvalidOperationException)
+        {
+            return (null, null);
+        }
+    }
+
+    // 1) the row is visible already; 2) the right page is shown: only scroll (from where the previous row was found, rows come in list order); 3) select the
+    // tree page (this rebuilds the list) and scroll. Steps 1-2 skip the tree selection, which is the slow part.
+    private (AutomationElement? name, AutomationElement? value) LocateOnPage(Window window, Param p)
+    {
+        var visible = TryFindVisible(window, p);
+        if (visible.name != null)
+        {
+            return visible;
+        }
+
+        try
+        {
+            if (PageIsShown(window, p))
+            {
+                var scanned = ScanPages(window, p);
+                if (scanned.name != null)
+                {
+                    return scanned;
+                }
+            }
+
+            string? crumb = ConfigureNav.SelectScope(window, p.Scope);      // re-selecting rebuilds the list
             if (crumb == null)
             {
                 return (null, null);
             }
 
-            var list = ConfigureNav.WaitListReady(window, 20000, _log, p.Label);
-            if (list == null)
-            {
-                _log("NOTE  | " + p.Label + " | the parameter list showed no parameters within 20 s of selecting the page");
-                return (null, null);
-            }
-
-            double view = 100;
-            var scroll = list.Patterns.Scroll.PatternOrDefault;
-            bool scrollable = scroll != null && scroll.VerticallyScrollable.ValueOrDefault;
-            if (scrollable)
-            {
-                view = Math.Max(5, scroll!.VerticalViewSize.ValueOrDefault);
-            }
-
-            double start = _lastPct.TryGetValue(p.Scope, out double last) ? Math.Max(0, last - view / 2) : 0;
-            foreach (double from in new[] { start, 0 })
-            {
-                for (double pct = from; ; pct += view / 2)
-                {
-                    list = window.FindFirstDescendant(cf => cf.ByAutomationId("ParametersList")) ?? list;
-                    scroll = list.Patterns.Scroll.PatternOrDefault;
-                    scrollable = scroll != null && scroll.VerticallyScrollable.ValueOrDefault;      // decided again on every step (the list may become scrollable late)
-                    if (scrollable)
-                    {
-                        view = Math.Max(5, scroll!.VerticalViewSize.ValueOrDefault);
-                        scroll!.SetScrollPercent(-1, Math.Min(pct, 100));
-                        Thread.Sleep(150);
-                    }
-
-                    var nameEl = list.FindFirstDescendant(cf => cf.ByAutomationId(p.NameId));
-                    var valueEl = list.FindFirstDescendant(cf => cf.ByAutomationId(p.ValueId));
-                    if (nameEl != null && valueEl != null && (nameEl.Name ?? "").Trim() == p.Name)
-                    {
-                        _lastPct[p.Scope] = Math.Min(pct, 100);
-                        return (nameEl, valueEl);
-                    }
-
-                    if (!scrollable || pct >= 100)
-                    {
-                        break;
-                    }
-                }
-
-                if (start == 0)
-                {
-                    break;
-                }
-            }
+            return ScanPages(window, p);
         }
         catch (Exception ex) when (ex is FlaUI.Core.Exceptions.PropertyNotSupportedException or FlaUI.Core.Exceptions.ElementNotAvailableException or System.Runtime.InteropServices.COMException or InvalidOperationException)
         {
             _log("NOTE  | " + p.Label + " | page scan interrupted (" + ex.GetType().Name + ")");
+        }
+
+        return (null, null);
+    }
+
+    // The breadcrumb says the parameter's page is shown and the search box is empty (so the list is that page, not a search result).
+    private bool PageIsShown(Window window, Param p)
+    {
+        try
+        {
+            var box = window.FindFirstDescendant(cf => cf.ByAutomationId("searchTextBox"));
+            if (box != null && box.Patterns.Value.TryGetPattern(out var vp) && (vp.Value.ValueOrDefault ?? "").Length > 0)
+            {
+                return false;
+            }
+
+            string crumb = ConfigureNav.ReadBreadcrumb(window);
+            return p.Scope == ConfigureNav.GroupScope ? crumb.Contains("Group Channel Control", StringComparison.Ordinal)
+                : p.Scope > 0 ? crumb.Contains("Channel " + p.Scope + " Parameters", StringComparison.Ordinal)
+                : crumb.Contains("System Parameters", StringComparison.Ordinal) && !crumb.Contains("Channel", StringComparison.Ordinal);
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    // Scrolls the shown page in half-page steps until the row is found.
+    private (AutomationElement? name, AutomationElement? value) ScanPages(Window window, Param p)
+    {
+        var list = ConfigureNav.WaitListReady(window, 20000, _log, p.Label);
+        if (list == null)
+        {
+            _log("NOTE  | " + p.Label + " | the parameter list showed no parameters within 20 s");
+            return (null, null);
+        }
+
+        double view = 100;
+        var scroll = list.Patterns.Scroll.PatternOrDefault;
+        bool scrollable = scroll != null && scroll.VerticallyScrollable.ValueOrDefault;
+        if (scrollable)
+        {
+            view = Math.Max(5, scroll!.VerticalViewSize.ValueOrDefault);
+        }
+
+        double estimate = _scopeRows.TryGetValue(p.Scope, out var rowsOfScope)
+            ? ConfigureNav.EstimateScrollPercent(rowsOfScope.Count, rowsOfScope.IndexOf(p.ExcelRow), view) : -1;
+        double lastPct = _lastPct.TryGetValue(p.Scope, out double lp) ? lp : -1;
+        foreach (double pct in ConfigureNav.ScrollTries(estimate, lastPct, view))
+        {
+            list = window.FindFirstDescendant(cf => cf.ByAutomationId("ParametersList")) ?? list;
+            scroll = list.Patterns.Scroll.PatternOrDefault;
+            scrollable = scroll != null && scroll.VerticallyScrollable.ValueOrDefault;      // decided again on every step (the list may become scrollable late)
+            if (scrollable)
+            {
+                view = Math.Max(5, scroll!.VerticalViewSize.ValueOrDefault);
+                ConfigureNav.ScrollSteps++;
+                scroll!.SetScrollPercent(-1, pct);
+                Thread.Sleep(150);
+            }
+
+            var nameEl = list.FindFirstDescendant(cf => cf.ByAutomationId(p.NameId));
+            var valueEl = list.FindFirstDescendant(cf => cf.ByAutomationId(p.ValueId));
+            if (nameEl != null && valueEl != null && (nameEl.Name ?? "").Trim() == p.Name)
+            {
+                _lastPct[p.Scope] = pct;
+                return (nameEl, valueEl);
+            }
+
+            if (!scrollable)
+            {
+                break;
+            }
         }
 
         return (null, null);
@@ -919,23 +1141,27 @@ public class ConfigureChangeAndRestoreAllParametersTest
             }
         }
 
+        // The new value is CLOSE to the current one (about +-10 %, at least 3 steps), inside Min..Max. A value picked anywhere in a huge range (e.g. up to 4,294,967,295)
+        // is rounded by the GUI (float precision above 16,777,216) or refused by the unit (limits that depend on other parameters) - that is not what this test is about;
+        // the limits themselves are the job of the input-validation test.
         int decimals = cleaned.Contains('.') ? cleaned.Length - cleaned.IndexOf('.') - 1 : 0;
         double step = decimals == 0 ? 1 : Math.Pow(10, -decimals);
+        double span = Math.Min(Math.Max(step * 3, Math.Abs(cur0) * 0.1), Math.Min(hi - lo, 1_000_000));
         double value = cur0;
-        for (int i = 0; i < 50 && Math.Abs(value - cur0) < step / 2; i++)
+        for (int i = 0; i < 60 && Math.Abs(value - cur0) < step / 2; i++)
         {
-            double raw = lo + _random.NextDouble() * (hi - lo);
+            double raw = cur0 + (_random.NextDouble() * 2 - 1) * span;
             value = decimals == 0 ? Math.Round(raw) : Math.Round(raw, decimals);
             value = Math.Max(lo, Math.Min(hi, value));
         }
 
         if (Math.Abs(value - cur0) < step / 2)
         {
-            why = "could not find a different value inside " + Fmt(lo) + ".." + Fmt(hi);
+            why = "could not find a different value near " + cleaned + " inside " + Fmt(lo) + ".." + Fmt(hi);
             return null;
         }
 
-        why = "random value inside " + Fmt(lo) + ".." + Fmt(hi) + direction;
+        why = "value near the current one (+-" + Fmt(span) + ") inside " + Fmt(lo) + ".." + Fmt(hi) + direction;
         return value.ToString("F" + decimals, CultureInfo.InvariantCulture);
     }
 
@@ -959,7 +1185,9 @@ public class ConfigureChangeAndRestoreAllParametersTest
     // After opening the Configure tab (or Fetch / Reset) the GUI keeps loading the unit's parameters in the background and
     // shows "Fetching parameters... 5/688" in the status bar. Until that is finished the channel values are BLANK and the
     // search is disabled - so every locate/read must wait for it to disappear.
-    private bool WaitFetchDone(Window window, int timeoutMs, string reason)
+    private string? _staleProgress;      // a status text already judged "stale" (same counter, search box usable): not waited for again
+
+    private bool WaitFetchDone(Window window, int timeoutMs, string reason, bool quick = true)
     {
         var sw = Stopwatch.StartNew();
         long lastLog = -100000;
@@ -989,7 +1217,21 @@ public class ConfigureChangeAndRestoreAllParametersTest
 
             if (progress == null)
             {
-                // the status text flickers while the GUI works - it must stay away for 1 s in a row
+                _staleProgress = null;
+                // nothing is loading (e.g. no Fetch was pressed): two looks 150 ms apart are enough. Right after opening the tab / a global Fetch the status text
+                // flickers while the GUI works, so there it must stay away for 1 s in a row.
+                if (quick && !announced)
+                {
+                    if (absentSince == null)
+                    {
+                        absentSince = sw.ElapsedMilliseconds;
+                        Thread.Sleep(150);
+                        continue;
+                    }
+
+                    return true;
+                }
+
                 absentSince ??= sw.ElapsedMilliseconds;
                 if (sw.ElapsedMilliseconds - absentSince >= 1000)
                 {
@@ -1006,6 +1248,11 @@ public class ConfigureChangeAndRestoreAllParametersTest
             }
 
             absentSince = null;
+            if (progress == _staleProgress && FreshSearch(window) is { IsEnabled: true })
+            {
+                return true;       // the same stuck text as before: already judged, do not wait 8 s again
+            }
+
             announced = true;
             if (progress != lastProgress)
             {
@@ -1015,7 +1262,8 @@ public class ConfigureChangeAndRestoreAllParametersTest
             else if (sw.ElapsedMilliseconds - progressSince >= 8000 && FreshSearch(window) is { IsEnabled: true })
             {
                 // same counter for 8 s while the search box is usable = stale status text, not a real load (a real load disables the search)
-                _log("WARN  | the status bar is stuck on 'Fetching parameters... " + progress + "' for 8 s but the search box is enabled - treating the load as finished (" + reason + ")");
+                _log("WARN  | the status bar is stuck on 'Fetching parameters... " + progress + "' for 8 s but the search box is enabled - treating the load as finished (" + reason + "); not waited for again while it shows the same text");
+                _staleProgress = progress;
                 return true;
             }
 
@@ -1280,9 +1528,8 @@ public class ConfigureChangeAndRestoreAllParametersTest
             if (element.ControlType != ControlType.ComboBox)
             {
                 element.Focus();
+                Thread.Sleep(250);
             }
-
-            Thread.Sleep(250);
             if (element.Patterns.Value.TryGetPattern(out var vp))
             {
                 result = (vp.Value.Value ?? "").Trim();
@@ -1487,7 +1734,12 @@ public class ConfigureChangeAndRestoreAllParametersTest
             return;
         }
 
-        // text box: paste the whole value, then commit with Tab
+        // text box: paste the whole value, then commit with Enter. The keystrokes go to the FRONT window - it must be the GUI.
+        if (!AppConnection.EnsureGuiInFront(window))
+        {
+            throw new InvalidOperationException("Power Rider Studio is not the front window (the keystrokes would go to another window) and could not be brought forward");
+        }
+
         element.Focus();
         Thread.Sleep(200);
         Keyboard.TypeSimultaneously(VirtualKeyShort.CONTROL, VirtualKeyShort.KEY_A);
@@ -1659,8 +1911,9 @@ public class ConfigureChangeAndRestoreAllParametersTest
         string before = ReadAppLog();
         _log("CLICK | " + p.Label + " | Refresh this parameter from the unit");
         button.AsButton().Invoke();
+        // the row refresh reads one value (~0.5 s) and not every GUI version writes a log line for it: wait for the log only briefly
         var sw = Stopwatch.StartNew();
-        while (sw.ElapsedMilliseconds < 5000)
+        while (sw.ElapsedMilliseconds < 1500)
         {
             Thread.Sleep(150);
             if (ReadAppLog() != before)
@@ -1725,7 +1978,11 @@ public class ConfigureChangeAndRestoreAllParametersTest
                     if (Regex.IsMatch(added, @"Failed|Error|Timeout", RegexOptions.IgnoreCase))
                     {
                         // known GUI bug: "Failed to save..." appears although the value is stored - NOT a failure here, the read-back after Fetch decides
-                        _log("NOTE  | " + p.Label + " | the GUI log reports a problem after '" + label + "' (ignored, the read-back after Fetch decides)");
+                        if (!_guiSaveNoteShown)
+                        {
+                            _guiSaveNoteShown = true;
+                            _log("NOTE  | the GUI log says 'Failed to ... after " + label + "' although the value is saved (known GUI bug). Not a failure of this test: the value read back from the unit decides. Not repeated.");
+                        }
                     }
                 }
 

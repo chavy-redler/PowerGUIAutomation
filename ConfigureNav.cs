@@ -51,8 +51,80 @@ public static class ConfigureNav
         }
     }
 
+    // Empties the Configure search box through its own "Clear Search" (X) button when it holds text.
+    public static void ClearSearchText(Window w)
+    {
+        try
+        {
+            var box = w.FindFirstDescendant(cf => cf.ByAutomationId("searchTextBox"));
+            string text = "";
+            if (box != null && box.Patterns.Value.TryGetPattern(out var vp))
+            {
+                text = vp.Value.ValueOrDefault ?? "";
+            }
+
+            if (text.Length == 0)
+            {
+                return;
+            }
+
+            var x = w.FindFirstDescendant(cf => cf.ByHelpText("Clear Search"));
+            if (x != null && x.IsEnabled)
+            {
+                x.AsButton().Invoke();
+                Thread.Sleep(600);
+            }
+        }
+        catch
+        {
+            // best effort
+        }
+    }
+
     // Selects the scope's tree node and waits until the GUI's breadcrumb says so. Returns the breadcrumb, or null when it did not work.
+    public static int ScrollSteps;           // scroll positions tried while locating rows (shown at the end of tests 3 and 4)
+    public static int SelectScopeCalls;      // how many times a tree page was selected (shown at the end of test 3 to prove the page is not re-selected for every row)
+
     public static string? SelectScope(Window w, int scope)
+    {
+        SelectScopeCalls++;
+        ClearSearchText(w);      // a search text left in the box (by a user or by a search fallback) filters the list, so the tree page would show only its matches
+        string? crumb = SelectScopeOnce(w, scope);
+        if (crumb == null || scope == GroupScope)
+        {
+            return crumb;
+        }
+
+        // A System / channel page is a long, scrollable list. If it is not scrollable the GUI still shows an older view (e.g. the matches of a search that
+        // was just cleared, or a page that is still being built): select another page and come back so that the list is rebuilt.
+        if (!WaitScrollable(w, 1500))
+        {
+            SelectScopeOnce(w, GroupScope);
+            Thread.Sleep(500);
+            crumb = SelectScopeOnce(w, scope);
+        }
+
+        return crumb;
+    }
+
+    private static bool WaitScrollable(Window w, int timeoutMs)
+    {
+        var sw = Stopwatch.StartNew();
+        while (sw.ElapsedMilliseconds < timeoutMs)
+        {
+            var list = w.FindFirstDescendant(cf => cf.ByAutomationId("ParametersList"));
+            if (list != null && list.Patterns.Scroll.PatternOrDefault is { } sc && sc.VerticallyScrollable.ValueOrDefault)
+            {
+                return true;
+            }
+
+            Thread.Sleep(200);
+        }
+
+        return false;
+    }
+
+    private static string? SelectScopeOnce(Window w, int scope)
     {
         string nodeName = scope == GroupScope ? "Group Channel Control" : scope > 0 ? "Channel " + scope + " Parameters" : "System Parameters";
         var node = TreeItems(w).FirstOrDefault(x => x.Name == nodeName);
@@ -213,5 +285,54 @@ public static class ConfigureNav
         }
 
         return null;
+    }
+
+    // The parameter list is virtualized and the rows come in the order of the Excel sheet, so the position of a row can be ESTIMATED: scroll percent (0-100) that
+    // brings row `index` (0-based) of a list of `count` rows into the middle of the view (`viewPercent` = VerticalViewSize). Scrolling one half-page at a
+    // time from the top costs a UIA search per step; this goes (almost) straight to the row. Returns -1 when unknown.
+    public static double EstimateScrollPercent(int count, int index, double viewPercent)
+    {
+        if (count <= 0 || index < 0)
+        {
+            return -1;
+        }
+
+        double visible = Math.Max(1.0, count * viewPercent / 100.0);
+        if (count <= visible)
+        {
+            return 0;
+        }
+
+        return Math.Max(0, Math.Min(100, (index - visible / 2.0) / (count - visible) * 100.0));
+    }
+
+    // Scroll positions to try, best first: the estimate and its neighbours, the position where the previous row was found, then a sweep of the whole list.
+    public static IEnumerable<double> ScrollTries(double estimate, double lastPercent, double viewPercent)
+    {
+        var seen = new HashSet<int>();
+        var all = new List<double>();
+        if (estimate >= 0)
+        {
+            all.AddRange(new[] { estimate, estimate - viewPercent / 2, estimate + viewPercent / 2, estimate - viewPercent, estimate + viewPercent });
+        }
+
+        if (lastPercent >= 0)
+        {
+            all.Add(lastPercent);
+        }
+
+        for (double p = 0; p <= 100 + viewPercent / 2; p += viewPercent / 2)
+        {
+            all.Add(p);
+        }
+
+        foreach (double p in all)
+        {
+            double clamped = Math.Max(0, Math.Min(100, p));
+            if (seen.Add((int)Math.Round(clamped)))
+            {
+                yield return clamped;
+            }
+        }
     }
 }
