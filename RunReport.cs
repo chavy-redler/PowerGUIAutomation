@@ -3,7 +3,7 @@ using ClosedXML.Excel;
 
 namespace PowerGUIAutomation;
 
-// What the failures workbooks of tests 3 and 4 have in common (Failures\<Test>_<PN>_<run start>.xlsx next to the exe).
+// What the failures workbooks of tests 2 and 3 have in common (Failures\<Test>_<PN>_<run start>.xlsx next to the exe).
 //
 // The file name is fixed when the run starts, so the log can name it and the same file is REWRITTEN: once at the start (Status "Running"),
 // after every failure, and at the end - whatever the end is (finished, stopped at a failure, stuck, Ctrl+C, closed console, crash). A run that
@@ -66,13 +66,19 @@ public sealed class RunReport
     public void AddRunSheet(XLWorkbook wb, IEnumerable<(string Key, string Value)> extra)
     {
         var ws = wb.AddWorksheet(SheetRun);
-        var lines = new List<(string, string)>
+        var lines = new List<(string, string)>();
+        if (TestInstructions.Describe(TestInstructions.Current).Length > 0)
+        {
+            lines.Add(("Test", TestInstructions.Describe(TestInstructions.Current)));
+        }
+
+        lines.AddRange(new (string, string)[]
         {
             ("Status", Status),
             ("Started", Started.ToString("yyyy-MM-dd HH:mm:ss")),
             ("Ended", Ended?.ToString("yyyy-MM-dd HH:mm:ss") ?? "(not finished)"),
             ("Run time", Format(Elapsed)),
-        };
+        });
         lines.AddRange(extra.Select(e => (e.Key, e.Value)));
         for (int i = 0; i < lines.Count; i++)
         {

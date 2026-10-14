@@ -31,7 +31,7 @@ namespace PowerGUIAutomation.Tests;
 // and parameters with no range and no unit rule.
 //
 // SAFETY: this test WRITES parameters to the connected unit and saves them to flash (Reset Unit only if DoReset is on). There is no
-// confirmation question; the "Before test 3" frame of the main menu (TestInstructions.cs) tells the user to reset the unit to default first.
+// confirmation question; the "Before test 2" frame of the main menu (TestInstructions.cs) tells the user to reset the unit to default first.
 public class ConfigureChangeAndRestoreAllParametersTest
 {
     private const int MaxFindRetries = 12;
@@ -75,6 +75,36 @@ public class ConfigureChangeAndRestoreAllParametersTest
         _unit = unit;
     }
 
+    // LOOP mode (the debug loop test): the same change-and-restore on the chosen rows, `rounds` times one after the other. The questions are asked by the
+    // caller. A failure that shows up only after many writes means the quantity is the problem and not the parameters.
+    private bool _preset;
+    private RowSelection? _presetSelection;
+    private string _presetDescription = "";
+    private bool _presetStopOnFail = true;
+    private int _rounds = 1, _round;
+    private bool _unlimited;                        // no number of rounds: the loop runs until the user stops it (or the first failure)
+    private bool Looping => _unlimited || _rounds > 1;
+    private string LoopText => !Looping ? "no loop (one pass)" : (_unlimited ? "round after round until stopped" : _rounds + " rounds") + (_timeLimit.HasValue ? ", time limit " + RunReport.Format(_timeLimit.Value) : "")
+                                                                  + "; rounds started: " + Math.Max(_round, 1);
+    private string RoundText => _unlimited ? "round " + _round : "round " + _round + " of " + _rounds;
+    private int _changes;                           // values written to the unit so far (changes + restores)
+    private int _firstFailureChanges = -1;          // writes done when the first failure came
+    private string _firstFailureWhere = "";
+
+    private TimeSpan? _timeLimit;
+
+    // rounds <= 0 = no limit on the rounds; timeLimit = the loop stops (cleanly, after the parameter that is being checked) when this much time has passed
+    public void UsePreset(RowSelection? selection, string description, bool stopOnFail, int rounds, TimeSpan? timeLimit = null)
+    {
+        _timeLimit = timeLimit;
+        _preset = true;
+        _presetSelection = selection;
+        _presetDescription = description;
+        _presetStopOnFail = stopOnFail;
+        _unlimited = rounds <= 0;
+        _rounds = Math.Max(1, rounds);
+    }
+
     private string[] Sheets => new[] { _unit.ParameterSheet };
     private bool _guiSaveNoteShown;
 
@@ -83,7 +113,11 @@ public class ConfigureChangeAndRestoreAllParametersTest
     private bool _stopOnFail = true;
     private const int MaxFailuresInARow = 5;      // continue mode only: this many in a row means a problem with the unit/GUI, not with one parameter
 
-    private sealed record FailedParam(Param P, string Step, string Why, bool Restored, string Kind = "", string Previous = "", string Attempted = "", string ReadBack = "");
+    private sealed record FailedParam(Param P, string Step, string Why, bool Restored, string Kind = "", string Previous = "", string Attempted = "", string ReadBack = "")
+    {
+        public int Round { get; init; }                      // the loop round (0 = not a loop)
+        public DateTime At { get; init; } = DateTime.Now;    // when the failure happened
+    }
 
     // What the test is doing right now (shown by the heartbeat and in the failure when nothing moves for NoProgressMinutes).
     private volatile string _where = "";
@@ -131,13 +165,19 @@ public class ConfigureChangeAndRestoreAllParametersTest
     private readonly List<FailedParam> _attempts = new();
     private int FailedParameters => _failures.Select(f => f.P.ExcelRow).Distinct().Count();
 
-    // The green V is an icon: it may not be visible to UI Automation at all. While RequireGreenV is false the V is only LOGGED (INDICATOR lines: what
-    // is visible to the right of the field), never used as a pass/fail rule. Set it to true when the INDICATOR lines show how the V appears.
-    private const bool RequireGreenV = false;
+    // The green V (see RowIcons) must appear right after a change. It is required only once a V has been seen in this run (a GUI build that never shows
+    // one must not fail every parameter) and only right after the CHANGE: after the refresh from the unit the GUI does not show it consistently.
+    private const bool RequireGreenV = true;
+    private bool _greenVSeen;
     private int _indicatorLogged;
 
     private void AddAttempt(Param p, string step, string kind, string previous, string attempted, string readBack)
     {
+        if (Looping)
+        {
+            kind = "Round " + _round + (_unlimited ? "" : " of " + _rounds) + ", after " + _changes + " writes to the unit: " + kind;
+        }
+
         previous = Normalize(previous);
         attempted = Normalize(attempted);
         readBack = Normalize(readBack);
@@ -169,16 +209,25 @@ public class ConfigureChangeAndRestoreAllParametersTest
         ? "The option " + Q(attempted) + " could not be selected in the combo box (it is disabled or not in the list): the combo box shows " + Q(shown) + " instead."
         : "The requested value " + Q(attempted) + " does not stay in the field: the field shows " + Q(shown) + ".";
 
-    // The chip next to the field = what the unit really holds, shown with a red X when the unit did not accept the written value.
-    private static string KindUnitShows(string chip, string attempted, bool afterRefresh, bool unitHoldsIt)
+    // The chip next to the field = what the unit reports for the row; a red X (seen by its colour) means the unit did not accept the written value.
+    private static string KindUnitShows(string chip, string attempted, bool redX, bool afterRefresh, bool unitHoldsIt)
     {
+        if (chip.Length == 0)
+        {
+            // only the red X, no different value next to the field
+            return afterRefresh
+                ? "After refresh, a red X is still shown next to the field."
+                : "A red X appeared next to the changed field" + (unitHoldsIt ? ", but after refresh, the new updated value is still shown." : ", and after refresh the new value is not kept.");
+        }
+
+        string x = redX ? " with a red X" : "";
         bool minusOne = Regex.IsMatch(chip, @"^\s*-1(\.0+)?\s*$");
         if (afterRefresh)
         {
-            return "After refresh, the unit still shows " + Q(chip) + " value next to the field with a red X" + (minusOne ? "." : " instead of the requested value " + Q(attempted) + ".");
+            return "After refresh, the unit still shows " + Q(chip) + " value next to the field" + x + (minusOne ? "." : " instead of the requested value " + Q(attempted) + ".");
         }
 
-        string head = "The unit shows " + Q(chip) + " value next to the changed field with a red X" + (minusOne ? "" : " instead of the requested value " + Q(attempted));
+        string head = "The unit shows " + Q(chip) + " value next to the changed field" + x + (minusOne ? "" : " instead of the requested value " + Q(attempted));
         return head + (unitHoldsIt ? ", but after refresh, the new updated value is still shown." : ", and after refresh the new value is not kept.");
     }
 
@@ -206,6 +255,7 @@ public class ConfigureChangeAndRestoreAllParametersTest
     // Recorded under the report's lock: the Ctrl+C / console-close handler writes the workbook from another thread.
     private void AddFailure(FailedParam f)
     {
+        f = f with { Round = Looping ? _round : 0 };
         if (_report == null)
         {
             _failures.Add(f);
@@ -240,7 +290,7 @@ public class ConfigureChangeAndRestoreAllParametersTest
             if (_current != null)
             {
                 _failures.Add(new FailedParam(_current, "interrupted", "The test was stopped by user while modifying this parameter, please verify that the value is correct.", false,
-                                              "The test was stopped by user while modifying this parameter, please verify that the value is correct."));
+                                              "The test was stopped by user while modifying this parameter, please verify that the value is correct.") { Round = Looping ? _round : 0 });
                 _checked++;      // the parameter that was being checked counts as checked
             }
 
@@ -277,6 +327,12 @@ public class ConfigureChangeAndRestoreAllParametersTest
     private void Fail(Param? p, string step, string why, string check, string kind = "")
     {
         string who = p?.Label ?? "(test setup)";
+        if (p != null && _firstFailureChanges < 0)
+        {
+            _firstFailureChanges = _changes;
+            _firstFailureWhere = p.Label + (Looping ? ", " + RoundText : "");
+        }
+
         _log("FAIL  | " + who + " | STEP: " + step + " | WHY: " + why + " | CHECK: " + check);
         if (p != null && _curStep.Length == 0)
         {
@@ -315,9 +371,15 @@ public class ConfigureChangeAndRestoreAllParametersTest
                  : _stopOnFail ? "Stopped after the first failure" : "Completed - with failures";
         _report?.Finish(status);
         _log("RESULT| " + new string('=', 90));
-        _log("RESULT| " + (passed ? "PASSED" : "FAILED") + " | unit=" + _unit.Name + " | parameters changed+restored=" + passedCount + " of " + done + " checked | failed=" + FailedParameters + " | skipped=" + skipped
+        _log("RESULT| " + (passed ? "PASSED" : _failures.Count == 0 ? "STOPPED" : "FAILED") + " | unit=" + _unit.Name + " | parameters changed+restored=" + passedCount + " of " + done + " checked | failed=" + FailedParameters + " | skipped=" + skipped
              + " | mode=" + (_stopOnFail ? "stop on fail" : "continue"));
         _log("RESULT| status          : " + status);
+        if (Looping)
+        {
+            _log("RESULT| loop            : " + _round + (_unlimited ? "" : " of " + _rounds) + " rounds started, " + _changes + " writes to the unit in total; "
+                 + (_firstFailureChanges >= 0 ? "the FIRST failure came after " + _firstFailureChanges + " writes (" + _firstFailureWhere + ")" : "no failure"));
+        }
+
         if (_report != null)
         {
             _log("RESULT| total run time  : " + RunReport.Format(_report.Elapsed) + "  (" + _report.Started.ToString("HH:mm:ss") + " - " + (_report.Ended ?? DateTime.Now).ToString("HH:mm:ss") + ")");
@@ -379,6 +441,11 @@ public class ConfigureChangeAndRestoreAllParametersTest
                 using var wb = new XLWorkbook();
                 var ws = wb.AddWorksheet(RunReport.SheetFailed);
                 string[] headers = { "Excel row", "Channel", "Parameter", "Failure type", "Previous value", "Value we tried to write", "Value read from the unit", "Unit", "GUI version", "Run time" };
+                if (Looping)
+                {
+                    headers = headers.Append("Loop round").ToArray();
+                }
+
                 for (int i = 0; i < headers.Length; i++)
                 {
                     ws.Cell(1, i + 1).Value = headers[i];
@@ -397,7 +464,12 @@ public class ConfigureChangeAndRestoreAllParametersTest
                     ws.Cell(r, 7).Value = f.ReadBack;
                     ws.Cell(r, 8).Value = _unit.Name;
                     ws.Cell(r, 9).Value = _guiVersion;
-                    ws.Cell(r, 10).Value = DateTime.Now.ToString("yyyy-MM-dd HH:mm");
+                    ws.Cell(r, 10).Value = f.At.ToString("yyyy-MM-dd HH:mm");
+                    if (Looping)
+                    {
+                        ws.Cell(r, 11).Value = f.Round > 0 ? "Round " + f.Round + (_unlimited ? "" : " of " + _rounds) : "";
+                    }
+
                     r++;
                 }
 
@@ -407,6 +479,7 @@ public class ConfigureChangeAndRestoreAllParametersTest
                 {
                     ("Unit", _unit.Name),
                     ("Rows of this run", _rowsDescription),
+                    ("Loop", LoopText),
                 });
                 report.Save(wb);
                 return report.Path;
@@ -475,19 +548,45 @@ public class ConfigureChangeAndRestoreAllParametersTest
         Console.WriteLine("WARNING: this test WRITES parameters to the connected unit and saves them to flash (change, Save, Fetch, restore default).");
         Console.WriteLine();
 
-        Console.WriteLine("When a parameter fails:");
-        Console.WriteLine("  1. stop at the first failure  [default]");
-        Console.WriteLine("  2. continue with the next parameter; every failure is listed at the end (and in the Failures folder)");
-        Console.Write("Choice [1]: ");
-        _stopOnFail = (Console.ReadLine() ?? "").Trim() != "2";
+        RowSelection? selection;
+        if (_preset)
+        {
+            _stopOnFail = _presetStopOnFail;
+            selection = _presetSelection;
+            _rowsDescription = _presetDescription;
+        }
+        else
+        {
+            Console.WriteLine("When a parameter fails:");
+            Console.WriteLine("  1. stop at the first failure  [default]");
+            Console.WriteLine("  2. continue with the next parameter; every failure is listed at the end (and in the Failures folder)");
+            Console.Write("Choice [1]: ");
+            _stopOnFail = (Console.ReadLine() ?? "").Trim() != "2";
 
-        var selection = RowSelection.Ask(FilePrefix, _unit.PartNumber, out _rowsDescription);
+            selection = RowSelection.Ask(FilePrefix, _unit.PartNumber, out _rowsDescription);
+
+            Console.WriteLine("Loop (repeat the whole run):");
+            Console.Write("  Enter = run once,  N = N rounds,  0 = round after round until you stop it: ");
+            string loopText = (Console.ReadLine() ?? "").Trim();
+            if (int.TryParse(loopText, out int loopRounds) && loopRounds != 1)
+            {
+                _unlimited = loopRounds <= 0;
+                _rounds = Math.Max(1, loopRounds);
+                Console.Write("  Stop automatically after how many hours? (Enter = no limit): ");
+                if (double.TryParse((Console.ReadLine() ?? "").Trim().Replace(',', '.'), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out double hours) && hours > 0)
+                {
+                    _timeLimit = TimeSpan.FromHours(hours);
+                }
+            }
+        }
+
         Console.WriteLine();
 
         _report = new RunReport(FilePrefix, _unit.PartNumber);
         RunClock.Start();      // the menu's "took" time starts here: the questions above are not counted
         _log("START | Configure change-and-restore test | unit=" + _unit.Name + " (sheet '" + _unit.ParameterSheet + "') | GUI version=" + _guiVersion
-             + " | on failure: " + (_stopOnFail ? "stop" : "continue") + " | rows: " + _rowsDescription);
+             + " | on failure: " + (_stopOnFail ? "stop" : "continue") + " | rows: " + _rowsDescription
+             + (Looping ? " | LOOP: " + (_unlimited ? "round after round until you stop it" : _rounds + " rounds") + " of the same rows" : ""));
         if (selection?.SourceFile != null)
         {
             _log("INFO  | RE-RUN of the failed rows listed in: " + selection.SourceFile);
@@ -572,89 +671,114 @@ public class ConfigureChangeAndRestoreAllParametersTest
 
         int done = 0, passed = 0, skipped = 0, index = 0, inARow = 0;
         var watch = Stopwatch.StartNew();
-        foreach (var p in todo)
+        for (int round = 1; _unlimited || round <= _rounds; round++)
         {
-            if (StopControl.Requested)
+            _round = round;
+            index = 0;
+            if (Looping)
             {
-                // the stop key: the previous parameter is finished and restored, nothing is half done
-                _log("STOPPED | the stop key was pressed - the run stops here, the last parameter was finished and restored");
-                _log("RESUME| to continue later answer 'Excel rows to run' with:  " + p.ExcelRow + "-  (from this parameter to the end)");
-                ClearSearch(window);
-                LogResult(false, done, passed, true, skipped, "Stopped by the user (stop key) after finishing the last parameter");
-                return false;
+                _log("ROUND | LOOP ROUND " + round + (_unlimited ? "" : " OF " + _rounds) + " STARTED | " + todo.Count + " parameters | failed parameters so far: " + FailedParameters
+                     + " | writes to the unit so far: " + _changes + " | running for " + RunReport.Format(watch.Elapsed) + (_timeLimit.HasValue ? " (time limit " + RunReport.Format(_timeLimit.Value) + ")" : ""));
             }
+            foreach (var p in todo)
+            {
+                if (StopControl.Requested)
+                {
+                    // the stop key: the previous parameter is finished and restored, nothing is half done
+                    _log("STOPPED | the stop key was pressed - the run stops here, the last parameter was finished and restored");
+                    _log("RESUME| to continue later answer 'Excel rows to run' with:  " + p.ExcelRow + "-  (from this parameter to the end)");
+                    ClearSearch(window);
+                    LogResult(false, done, passed, true, skipped, "Stopped by the user (stop key) after finishing the last parameter");
+                    return false;
+                }
 
-            index++;
-            _current = p;
-            _log("DRAW  | " + index + "/" + todo.Count + " | " + p.Label);
-            Outcome outcome;
-            bool stuck = false;
-            try
-            {
-                outcome = RunWatched(() => TestOne(window, search, p), out stuck);
-            }
-            catch (Exception ex)
-            {
-                Fail(p, "unexpected error", "an unexpected error occurred: " + ex.GetType().Name + ": " + ex.Message, "see the message");
-                _lastRestored = false;
-                outcome = Outcome.Failed;
-            }
+                if (_timeLimit.HasValue && watch.Elapsed >= _timeLimit.Value)
+                {
+                    // the loop's time limit: the previous parameter is finished and restored, nothing is half done
+                    _log("STOPPED | the time limit of " + RunReport.Format(_timeLimit.Value) + " was reached - the run stops here, the last parameter was finished and restored");
+                    ClearSearch(window);
+                    LogResult(_failures.Count == 0, done, passed, true, skipped, "Completed - the time limit of " + RunReport.Format(_timeLimit.Value) + " was reached");
+                    return _failures.Count == 0;
+                }
 
-            if (stuck)
-            {
-                Fail(p, "stuck", "the test got stuck: no progress for " + NoProgressMinutes + " minutes (last action: " + _where + "), please verify the value of this parameter on the unit", "the GUI may be frozen or a UI call is not returning; look at the GUI, restart it if needed and run again from this row");
-                _lastRestored = false;
+                index++;
+                _current = p;
+                _log("DRAW  | " + (Looping ? RoundText + " | " : "") + index + "/" + todo.Count + " | " + p.Label);
+                Outcome outcome;
+                bool stuck = false;
+                try
+                {
+                    outcome = RunWatched(() => TestOne(window, search, p), out stuck);
+                }
+                catch (Exception ex)
+                {
+                    Fail(p, "unexpected error", "an unexpected error occurred: " + ex.GetType().Name + ": " + ex.Message, "see the message");
+                    _lastRestored = false;
+                    outcome = Outcome.Failed;
+                }
+
+                if (stuck)
+                {
+                    Fail(p, "stuck", "the test got stuck: no progress for " + NoProgressMinutes + " minutes (last action: " + _where + "), please verify the value of this parameter on the unit", "the GUI may be frozen or a UI call is not returning; look at the GUI, restart it if needed and run again from this row");
+                    _lastRestored = false;
+                    _current = null;
+                    _finished = index;
+                    _failures.Add(new FailedParam(p, _curStep, _curWhy, false, _curKind) { Round = Looping ? _round : 0 });
+                    _log("STOPPED | the run is stuck and cannot continue safely");
+                    _log("RESUME| to continue later answer 'Excel rows to run' with:  " + p.ExcelRow + "-  (after checking this parameter on the unit)   or give the failures file (only its failed rows)");
+                    LogResult(false, done + 1, passed, false, skipped, "Stopped - stuck (no progress for " + NoProgressMinutes + " minutes)");
+                    return false;
+                }
+
                 _current = null;
                 _finished = index;
-                _failures.Add(new FailedParam(p, _curStep, _curWhy, false, _curKind));
-                _log("STOPPED | the run is stuck and cannot continue safely");
-                _log("RESUME| to continue later answer 'Excel rows to run' with:  " + p.ExcelRow + "-  (after checking this parameter on the unit)   or give the failures file (only its failed rows)");
-                LogResult(false, done + 1, passed, false, skipped, "Stopped - stuck (no progress for " + NoProgressMinutes + " minutes)");
-                return false;
-            }
-
-            _current = null;
-            _finished = index;
-            if (outcome == Outcome.Skipped)
-            {
-                skipped++;
-                _skippedCount = skipped;
-                continue;
-            }
-
-            done++;
-            _checked = done;
-            _passedCount = passed;
-            if (outcome == Outcome.Failed)
-            {
-                RecordParameterFailure(p);
-                inARow++;
-                if (_stopOnFail)
+                if (outcome == Outcome.Skipped)
                 {
-                    _log("STOPPED | halted after first failure - remaining parameters were not checked");
-                    var nextParam = index < todo.Count ? todo[index] : null;
-                    _log("RESUME| to continue later answer 'Excel rows to run' with:  " + p.ExcelRow + "-  (this parameter again)"
-                         + (nextParam != null ? "   or   " + nextParam.ExcelRow + "-  (skip it, continue with " + nextParam.Name + ")" : ""));
-                    ClearSearch(window);
-                    LogResult(false, done, passed, _lastRestored, skipped);
-                    return false;
+                    skipped++;
+                    _skippedCount = skipped;
+                    continue;
                 }
 
-                _log("INFO  | failure " + FailedParameters + " recorded - continuing with the next parameter");
-                if (inARow >= MaxFailuresInARow)
+                done++;
+                _checked = done;
+                _passedCount = passed;
+                if (outcome == Outcome.Failed)
                 {
-                    _log("STOPPED | " + inARow + " parameters failed in a row - that looks like a problem with the unit or the GUI, not with the parameters");
-                    ClearSearch(window);
-                    LogResult(false, done, passed, _lastRestored, skipped, "Stopped - " + inARow + " parameters failed in a row (unit or GUI problem?)");
-                    return false;
+                    RecordParameterFailure(p);
+                    inARow++;
+                    if (_stopOnFail)
+                    {
+                        _log("STOPPED | halted after first failure - remaining parameters were not checked");
+                        var nextParam = index < todo.Count ? todo[index] : null;
+                        _log("RESUME| to continue later answer 'Excel rows to run' with:  " + p.ExcelRow + "-  (this parameter again)"
+                             + (nextParam != null ? "   or   " + nextParam.ExcelRow + "-  (skip it, continue with " + nextParam.Name + ")" : ""));
+                        ClearSearch(window);
+                        LogResult(false, done, passed, _lastRestored, skipped);
+                        return false;
+                    }
+
+                    _log("INFO  | failure " + FailedParameters + " recorded - continuing with the next parameter");
+                    if (inARow >= MaxFailuresInARow)
+                    {
+                        _log("STOPPED | " + inARow + " parameters failed in a row - that looks like a problem with the unit or the GUI, not with the parameters");
+                        ClearSearch(window);
+                        LogResult(false, done, passed, _lastRestored, skipped, "Stopped - " + inARow + " parameters failed in a row (unit or GUI problem?)");
+                        return false;
+                    }
+
+                    continue;
                 }
 
-                continue;
+                inARow = 0;
+                passed++;
+                _passedCount = passed;
             }
 
-            inARow = 0;
-            passed++;
-            _passedCount = passed;
+            if (Looping)
+            {
+                _log("ROUND | LOOP ROUND " + round + (_unlimited ? "" : " OF " + _rounds) + " FINISHED | checked=" + done + " passed=" + passed + " failed parameters=" + FailedParameters
+                     + " | writes to the unit so far: " + _changes + " | " + RunReport.Format(watch.Elapsed));
+            }
         }
 
         ClearSearch(window);
@@ -888,9 +1012,12 @@ public class ConfigureChangeAndRestoreAllParametersTest
             return Outcome.Failed;
         }
 
+        // The value the parameter has BEFORE the test is its own default (the unit is reset first): after the changes the parameter is put back to exactly this value
+        // - not typed from the Excel - and then that value is checked against the Excel default (RestoreDefault).
+        string originalValue = Normalize(before);
         if (!SameValue(before, p.Default))
         {
-            _log("WARN  | " + p.Label + " | before the test the value is '" + before + "' but the Excel default is '" + p.Default + "' (the unit is not at its default)");
+            _log("NOTE  | " + p.Label + " | before the test the value is '" + before + "' but the Excel default is '" + p.Default + "' - checked again after the restore");
         }
 
         // The constraints text is already inside the parameter's row (hidden) - read it from there; hovering is only the fallback.
@@ -1007,9 +1134,9 @@ public class ConfigureChangeAndRestoreAllParametersTest
 
         ok = ok && !optionFailed;
 
-        _log("STEP  | 6 restore the Excel default '" + p.Default + "' and verify it");
-        At("6 restoring the default '" + p.Default + "'");
-        bool restored = RestoreDefault(window, search, p);
+        _log("STEP  | 6 put the parameter back to the value it had before the test ('" + originalValue + "') and check that it is the Excel default '" + p.Default + "'");
+        At("6 restoring the original value '" + originalValue + "'");
+        bool restored = RestoreDefault(window, search, p, originalValue);
         _lastRestored = restored;
         return ok && restored ? Outcome.Passed : Outcome.Failed;
     }
@@ -1035,7 +1162,7 @@ public class ConfigureChangeAndRestoreAllParametersTest
         At("3 setting the value '" + newValue + "'");
         string previous = Normalize(before);
         bool combo = valueEl.ControlType == ControlType.ComboBox;
-        bool chipWasThere = ReadRowState(window, p).Chip.Length > 0;      // a chip that is already there says nothing about this change
+        _changes++;
         SetValue(window, valueEl, newValue);
         string shownNow = ReadParam(window, p, out _);
         _log("SET   | " + p.Label + " | '" + before + "' -> '" + newValue + "' | the GUI now shows '" + shownNow + "' | " + why
@@ -1054,14 +1181,19 @@ public class ConfigureChangeAndRestoreAllParametersTest
         // A. right after the change (the GUI applies it to the unit at once): value in the field, no chip with the unit's own value
         var stateA = WaitRowSettled(window, p);
         LogRowState(p, "right after the change", stateA);
-        string chipA = chipWasThere ? "" : stateA.Chip;
+        string chipA = ChipMismatch(stateA.Chip, newValue);
         bool fieldOk = SameValue(shownNow, newValue);
-        bool vMissingA = RequireGreenV && stateA.Indicators.Length == 0;
-        if (!fieldOk || chipA.Length > 0 || vMissingA)
+        if (stateA.GreenV)
+        {
+            _greenVSeen = true;
+        }
+
+        bool vMissingA = RequireGreenV && _greenVSeen && !_iconWaitOff && !stateA.GreenV && !stateA.RedX;
+        if (!fieldOk || chipA.Length > 0 || stateA.RedX || vMissingA)
         {
             string readBack = DiscardAndRead(window, search, p);
             bool unitHolds = SameValue(readBack, newValue);
-            string kind = chipA.Length > 0 ? KindUnitShows(chipA, newValue, false, unitHolds)
+            string kind = chipA.Length > 0 || stateA.RedX ? KindUnitShows(chipA, newValue, stateA.RedX, false, unitHolds)
                         : !fieldOk ? KindFieldWentBack(combo, newValue, shownNow)
                         : "No green V appeared after the change.";
             // "value read from the unit" = what the unit shows next to the field (the chip, e.g. -1); without a chip, what the unit returns after the refresh
@@ -1109,18 +1241,20 @@ public class ConfigureChangeAndRestoreAllParametersTest
         bool changed = SameValue(after, newValue);
         var stateB = ReadRowState(window, p);
         LogRowState(p, "after the refresh", stateB);
-        string chipB = stateB.Chip;
-        bool vMissingB = RequireGreenV && stateB.Indicators.Length == 0;
-        bool good = changed && chipB.Length == 0 && !vMissingB;
+        string chipB = ChipMismatch(stateB.Chip, newValue);
+        bool good = changed && chipB.Length == 0 && !stateB.RedX;
         _log((good ? "PASS  | " : "FAIL  | ") + p.Label + " | after Save/refresh: expected='" + newValue + "' actual='" + after + "'");
         if (!good)
         {
             string kind = !changed ? KindAfterRefresh(after, newValue, previous, p.Default)
-                        : chipB.Length > 0 ? KindUnitShows(chipB, newValue, true, true)
-                        : "No green V appeared after the refresh.";
+                        : KindUnitShows(chipB, newValue, stateB.RedX, true, true);
             if (!changed && chipB.Length > 0)
             {
-                kind += " Next to the field the unit shows " + Q(chipB) + ".";
+                kind += " Next to the field the unit shows " + Q(chipB) + (stateB.RedX ? " with a red X." : ".");
+            }
+            else if (!changed && stateB.RedX)
+            {
+                kind += " A red X is shown next to the field.";
             }
 
             AddAttempt(p, "5 after Save and refresh", kind, previous, newValue, chipB.Length > 0 ? chipB : after);
@@ -1140,7 +1274,7 @@ public class ConfigureChangeAndRestoreAllParametersTest
 
     // ---- the row's own state: the chip (what the unit holds) and the indicator icons to the right of the value field
 
-    private sealed record RowState(string Chip, bool Spinner, string Indicators);
+    private sealed record RowState(string Chip, bool Spinner, string Indicators, bool RedX, bool GreenV);
 
     // Chip = a visible, unlabelled text to the RIGHT of the value field (the ListBoxItem is two levels above the field). Indicators = every other
     // visible element to the right of the field (the green V / red X are icons: this tells whether UI Automation exposes them). Spinner = the row's
@@ -1153,7 +1287,7 @@ public class ConfigureChangeAndRestoreAllParametersTest
             var item = el?.Parent?.Parent;
             if (el == null || item == null)
             {
-                return new RowState("", false, "");
+                return new RowState("", false, "", false, false);
             }
 
             double right = el.BoundingRectangle.Right;
@@ -1187,13 +1321,23 @@ public class ConfigureChangeAndRestoreAllParametersTest
                 }
             }
 
-            return new RowState(chip, spinner, string.Join(", ", indicators));
+            var (redX, greenV) = RowIcons.Read(el, item);
+            return new RowState(chip, spinner, string.Join(", ", indicators), redX, greenV);
         }
         catch
         {
-            return new RowState("", false, "");
+            return new RowState("", false, "", false, false);
         }
     }
+
+    // The icon shows up when the unit has answered; no icon at all for many rows in a row = this GUI build does not show one (or it cannot be seen): stop waiting.
+    private bool _iconWaitOff;
+    private int _noIconRows;
+
+    // The chip shows what the unit reports for the row. Some GUI builds show it after EVERY set, also when the unit took the value (then it equals the
+    // requested value, next to the green V); a red X comes with a chip that is DIFFERENT from the requested value ("-1", or the old value). So the chip is a
+    // problem only when it differs from the requested value. Returns the chip text when it is a problem, "" otherwise.
+    private static string ChipMismatch(string chip, string requested) => chip.Length > 0 && !SameValue(chip, requested) ? chip : "";
 
     // Gives the GUI time to answer the change (the row shows a spinner while it is sent), then reads the row.
     private RowState WaitRowSettled(Window window, Param p)
@@ -1207,21 +1351,42 @@ public class ConfigureChangeAndRestoreAllParametersTest
             state = ReadRowState(window, p);
         }
 
+        if (!_iconWaitOff && !state.RedX && !state.GreenV)
+        {
+            var wait = Stopwatch.StartNew();
+            while (!state.RedX && !state.GreenV && wait.ElapsedMilliseconds < 1200)
+            {
+                Thread.Sleep(100);
+                state = ReadRowState(window, p);
+            }
+        }
+
+        if (state.RedX || state.GreenV)
+        {
+            _noIconRows = 0;
+        }
+        else if (!_iconWaitOff && ++_noIconRows >= 20)
+        {
+            _iconWaitOff = true;
+            _log("NOTE  | no red X / green V icon was seen for 20 rows in a row - not waiting for the icon any more (this GUI build may not show it, or the screenshot cannot see it)");
+        }
+
         return state;
     }
 
     // The first dozen rows are logged in full (to learn how the green V appears to UI Automation); after that only the rows that have a chip.
     private void LogRowState(Param p, string when, RowState state)
     {
-        if (state.Chip.Length > 0 || _indicatorLogged < 12)
+        if (state.Chip.Length > 0 || state.RedX || _indicatorLogged < 12)
         {
-            if (state.Chip.Length == 0)
+            if (state.Chip.Length == 0 && !state.RedX)
             {
                 _indicatorLogged++;
             }
 
-            _log("INFO  | INDICATOR | " + p.Label + " | " + when + " | chip next to the field: " + (state.Chip.Length > 0 ? "'" + state.Chip + "' (the unit's own value, red X)" : "none")
-                 + " | other visible elements right of the field: " + (state.Indicators.Length > 0 ? state.Indicators : "none (a green V icon is not visible to UI Automation, or not shown)"));
+            _log("INFO  | INDICATOR | " + p.Label + " | " + when + " | chip next to the field: " + (state.Chip.Length > 0 ? "'" + state.Chip + "' (the value the unit reports)" : "none")
+                 + " | icons seen by colour: red X=" + (state.RedX ? "YES" : "no") + ", green V=" + (state.GreenV ? "yes" : "no")
+                 + " | other UIA elements right of the field: " + (state.Indicators.Length > 0 ? state.Indicators : "none"));
         }
     }
 
@@ -1242,14 +1407,16 @@ public class ConfigureChangeAndRestoreAllParametersTest
         return false;
     }
 
-    private bool RestoreDefault(Window window, TextBox search, Param p)
+    // Puts the parameter back to `target` = the value it had BEFORE the test (its own default after the reset - not typed from the Excel), verifies that the unit
+    // returns it, and then checks that this value is the Excel default. Two separate failures: the restore itself, and the Excel default.
+    private bool RestoreDefault(Window window, TextBox search, Param p, string target)
     {
         try
         {
             var (_, v) = LocateRow(window, search, p, refresh: true);
             if (v == null)
             {
-                Fail(p, "6 restore default", "cannot restore the default: the parameter was not found again", "check the Configure screen manually");
+                Fail(p, "6 restore default", "cannot restore the parameter: it was not found again", "check the Configure screen manually");
                 return false;
             }
 
@@ -1257,42 +1424,42 @@ public class ConfigureChangeAndRestoreAllParametersTest
             v = freshV ?? v;
             if (now.Length == 0)
             {
-                Fail(p, "6 restore default", "cannot read the current value to compare with the default", "check the parameter on the unit manually");
+                Fail(p, "6 restore default", "cannot read the current value to compare with the original one", "check the parameter on the unit manually");
                 return false;
             }
 
-            if (SameValue(now, p.Default))
+            if (SameValue(now, target))
             {
-                _log("PASS  | " + p.Label + " | at the Excel default '" + p.Default + "'");
-                return true;
+                _log("PASS  | " + p.Label + " | already at the value it had before the test '" + target + "'");
+                return CheckAgainstExcel(p, now);
             }
 
-            _log("RESTORE| " + p.Label + " | '" + now + "' -> default '" + p.Default + "'");
+            _log("RESTORE| " + p.Label + " | '" + now + "' -> the value it had before the test '" + target + "'");
             bool comboR = v.ControlType == ControlType.ComboBox;
-            bool chipWasThereR = ReadRowState(window, p).Chip.Length > 0;
-            SetValue(window, v, p.Default);
+            _changes++;
+            SetValue(window, v, target);
             string typedNow = ReadParam(window, p, out var typedEl);
-            if (!SameValue(typedNow, p.Default))
+            if (!SameValue(typedNow, target))
             {
-                _log("NOTE  | " + p.Label + " | after typing the default the control shows '" + typedNow + "' - typing it once more");
+                _log("NOTE  | " + p.Label + " | after typing the original value the control shows '" + typedNow + "' - typing it once more");
                 Thread.Sleep(600);
-                SetValue(window, typedEl ?? v, p.Default);
+                SetValue(window, typedEl ?? v, target);
                 typedNow = ReadParam(window, p, out _);
-                if (!SameValue(typedNow, p.Default))
+                if (!SameValue(typedNow, target))
                 {
                     string readBack = DiscardAndRead(window, search, p);
-                    AddAttempt(p, "6 restore default", KindFieldWentBack(comboR, Normalize(p.Default), Normalize(typedNow)), Normalize(now), p.Default, readBack);
+                    AddAttempt(p, "6 restore default", KindFieldWentBack(comboR, Normalize(target), Normalize(typedNow)), Normalize(now), target, readBack);
                     return false;
                 }
             }
 
             var stateR = WaitRowSettled(window, p);
-            LogRowState(p, "right after typing the default", stateR);
-            string chipR = chipWasThereR ? "" : stateR.Chip;
-            if (chipR.Length > 0)
+            LogRowState(p, "right after typing the original value", stateR);
+            string chipR = ChipMismatch(stateR.Chip, target);
+            if (chipR.Length > 0 || stateR.RedX)
             {
                 string readBack = DiscardAndRead(window, search, p);
-                AddAttempt(p, "6 restore default", KindUnitShows(chipR, p.Default, false, SameValue(readBack, p.Default)), Normalize(now), p.Default, chipR);
+                AddAttempt(p, "6 restore default", KindUnitShows(chipR, target, stateR.RedX, false, SameValue(readBack, target)), Normalize(now), target, chipR.Length > 0 ? chipR : readBack);
                 return false;
             }
 
@@ -1303,20 +1470,35 @@ public class ConfigureChangeAndRestoreAllParametersTest
 
             var (_, v2) = LocateRow(window, search, p, refresh: true);
             string after = v2 == null ? "<NOT FOUND>" : ReadParam(window, p, out _);
-            bool isDefault = SameValue(after, p.Default);
-            _log((isDefault ? "PASS  | " : "FAIL  | ") + p.Label + " | back to default: expected='" + p.Default + "' actual='" + after + "'");
-            if (!isDefault)
+            bool back = SameValue(after, target);
+            _log((back ? "PASS  | " : "FAIL  | ") + p.Label + " | back to the original value: expected='" + target + "' actual='" + after + "'");
+            if (!back)
             {
-                AddAttempt(p, "6 restore default", KindAfterRefresh(after, p.Default, now, ""), Normalize(now), p.Default, after);
+                AddAttempt(p, "6 restore default", KindAfterRefresh(after, target, now, ""), Normalize(now), target, after);
+                return false;
             }
 
-            return isDefault;
+            return CheckAgainstExcel(p, after);
         }
         catch (Exception ex)
         {
-            Fail(p, "6 restore default", "an unexpected error occurred while restoring the default: " + ex.Message + " - please verify the value on the unit", "check the parameter on the unit manually");
+            Fail(p, "6 restore default", "an unexpected error occurred while restoring the parameter: " + ex.Message + " - please verify the value on the unit", "check the parameter on the unit manually");
             return false;
         }
+    }
+
+    // The parameter is back to its own default: is that the Excel default? If not, the unit was not at its default before the test, or the Excel default is wrong.
+    private bool CheckAgainstExcel(Param p, string unitValue)
+    {
+        if (SameValue(unitValue, p.Default))
+        {
+            _log("PASS  | " + p.Label + " | the restored value '" + unitValue + "' is the Excel default '" + p.Default + "'");
+            return true;
+        }
+
+        AddAttempt(p, "6 check against the Excel default", "After restoring, the unit shows " + Q(Normalize(unitValue)) + ", but the Excel default is " + Q(Normalize(p.Default))
+                   + ": the unit was not at its default before the test, or the Excel default is wrong.", unitValue, p.Default, unitValue);
+        return false;
     }
 
     // ------------------------------------------------------------------ value choice

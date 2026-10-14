@@ -24,9 +24,17 @@ public class DebugTests
         Console.WriteLine("Debug tests (read-only):");
         Console.WriteLine("  1. DebugCompareSubsetTest    - compare parameters to the Excel on chosen channels / parameters");
         Console.WriteLine("  2. DebugAutomationIdScanTest - AutomationId scan of all parameters (report to a new Excel file)");
+        Console.WriteLine("  3. DebugLoopTest             - LOOP: test 2's change-and-restore on a group of parameters, round after round until you stop it or one hour has passed (WRITES to the unit)");
         Console.Write("Choice [1]: ");
         string pick = (Console.ReadLine() ?? "").Trim();
         RunClock.Start();      // the menu's "took" time starts after the choice
+        StopControl.Start(_log, graceful: pick == "3");      // the loop test stops cleanly between parameters, the read-only ones at once
+        if (pick == "3")
+        {
+            _log("START | DebugLoopTest | unit=" + _unit.Name);
+            return new DebugLoopTest(_excelPath, _log, _unit).Run();
+        }
+
         if (pick == "2")
         {
             _log("START | DebugAutomationIdScanTest | unit=" + _unit.Name);

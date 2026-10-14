@@ -82,8 +82,8 @@ public static class ConfigureNav
     }
 
     // Selects the scope's tree node and waits until the GUI's breadcrumb says so. Returns the breadcrumb, or null when it did not work.
-    public static int ScrollSteps;           // scroll positions tried while locating rows (shown at the end of tests 3 and 4)
-    public static int SelectScopeCalls;      // how many times a tree page was selected (shown at the end of test 3 to prove the page is not re-selected for every row)
+    public static int ScrollSteps;           // scroll positions tried while locating rows (shown at the end of tests 2 and 3)
+    public static int SelectScopeCalls;      // how many times a tree page was selected (shown at the end of test 2 to prove the page is not re-selected for every row)
 
     public static string? SelectScope(Window w, int scope)
     {

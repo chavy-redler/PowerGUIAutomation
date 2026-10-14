@@ -107,6 +107,6 @@ public static class StopControl
         }
 
         _log("STOPPED | the stop key was pressed - stopping at once");
-        Environment.Exit(1);      // the ProcessExit handler of tests 3 and 4 writes the failures file
+        Environment.Exit(1);      // the ProcessExit handler of tests 2 and 3 writes the failures file
     }
 }

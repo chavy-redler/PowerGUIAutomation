@@ -62,8 +62,25 @@ public static class AppConnection
         return false;
     }
 
+    // The red X / green V are read from a screenshot (RowIcons): that needs Windows display scaling of 100% (the registry value is the DPI of the primary screen).
+    private static void WarnIfScaled()
+    {
+        try
+        {
+            if (Microsoft.Win32.Registry.GetValue(@"HKEY_CURRENT_USER\Control Panel\Desktop\WindowMetrics", "AppliedDPI", 96) is int dpi && dpi != 96)
+            {
+                Console.WriteLine("WARNING: Windows display scaling is " + (dpi * 100 / 96) + "%, not 100% - the red X / green V icons may not be found. Set Settings > Display > Scale to 100%.");
+            }
+        }
+        catch
+        {
+            // the setting cannot be read: nothing to warn about
+        }
+    }
+
     public static Window Attach(UIA3Automation automation)
     {
+        WarnIfScaled();
         var processes = Process.GetProcessesByName("PowerRiderStudio");
         if (processes.Length == 0)
         {

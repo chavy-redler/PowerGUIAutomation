@@ -28,14 +28,13 @@ namespace PowerGUIAutomation.Tests;
 //                         Max, a normal text with English letters, digits, space and symbols must be accepted
 // After every input the original value is typed back, so the unit ends exactly as it was (RAM and flash).
 //
-// Scope: System parameters and channel 1 (a parameter's validation is the same in every channel). Never touched: baud rates, addresses,
+// Scope: every System and channel parameter of the unit (all rows, or the rows / ranges / failures file given at the start, like test 2). Never touched: baud rates, addresses,
 // Logic Control / Logic Expression, Group Control.
 //
-// Like test 3, the run asks at the start: stop at the first failing input (default) or continue and list every failure at the end (log + a
+// Like test 2, the run asks at the start: stop at the first failing input (default) or continue and list every failure at the end (log + a
 // workbook in the Failures folder next to the logs), and which Excel rows to run (Enter = all, or "54-70, 72, 100-").
 public class ConfigureInputValidationTest
 {
-    private static readonly int[] ValidationChannels = { 1 };
     private const int RejectWaitMs = 1800;        // how long to wait for the red-X chip before deciding that the value was accepted
     private const string HebrewSample = "שלום";
     private static readonly string TextSample = Environment.GetEnvironmentVariable("VALIDATION_TEXT") is { Length: > 0 } t ? t : "Ab 1-_";      // env var: developer switch
@@ -239,15 +238,16 @@ public class ConfigureInputValidationTest
         }
 
         _scopeRows = rows.GroupBy(r => r.Scope).ToDictionary(g => g.Key, g => g.OrderBy(r => r.ExcelRow).Select(r => r.ExcelRow).ToList());
-        var todo = rows.Where(r => (r.Channel == 0 || ValidationChannels.Contains(r.Channel)) && r.Channel <= _unit.Channels
-                                   && !NeverChange.Contains(r.Name) && !IsLogicParam(r.Name) && r.Scope != ConfigureNav.GroupScope
-                                   && (onlyName.Length == 0 || r.Name.Contains(onlyName, StringComparison.OrdinalIgnoreCase))).ToList();
         Console.WriteLine();
         Console.WriteLine("When an input fails:");
         Console.WriteLine("  1. stop at the first failure  [default]");
         Console.WriteLine("  2. continue; every failure is listed at the end (and in the Failures folder)");
         Console.Write("Choice [1]: ");
         _stopOnFail = (Console.ReadLine() ?? "").Trim() != "2";
+
+        var todo = rows.Where(r => r.Channel <= _unit.Channels
+                                   && !NeverChange.Contains(r.Name) && !IsLogicParam(r.Name) && r.Scope != ConfigureNav.GroupScope
+                                   && (onlyName.Length == 0 || r.Name.Contains(onlyName, StringComparison.OrdinalIgnoreCase))).ToList();
 
         var selection = RowSelection.Ask(FilePrefix, _unit.PartNumber, out _rowsDescription);
         Console.WriteLine();
@@ -262,7 +262,7 @@ public class ConfigureInputValidationTest
             _log("WARN  | GUI '" + _guiVersion + "' is older than 2.1.2: this test was developed on 2.1.2 (a refused value leaves a red X + the stored value next to the field and Enter applies the value). Its results on this GUI are NOT validated.");
         }
 
-        _log("START | Configure input validation | unit=" + _unit.Name + " | scope: System + channel(s) " + string.Join(",", ValidationChannels)
+        _log("START | Configure input validation | unit=" + _unit.Name + " | scope: System + all " + _unit.Channels + " channels"
              + " | parameters=" + todo.Count + (onlyName.Length > 0 ? " | only names containing '" + onlyName + "'" : "") + " | on failure: " + (_stopOnFail ? "stop" : "continue")
              + " | rows: " + _rowsDescription + " | NOTHING is saved to flash");
         if (selection?.SourceFile != null)
@@ -416,7 +416,19 @@ public class ConfigureInputValidationTest
             return;
         }
 
+        // The unit must be at its defaults before the run (reset): a different value means the unit was not reset, a previous run left a value behind, or the Excel
+        // default is wrong. The parameter is still checked (and put back to the value it had), but this is reported - like in the change-and-restore test.
+        if (row.Default.Length > 0 && !SameValue(original, row.Default))
+        {
+            _log("WARN  | " + row.Label + " | before the test the value is '" + original + "' but the Excel default is '" + row.Default + "' (the unit is not at its default)");
+            AddFinding(new Finding(row, "(before the test)", "the unit is at its default", "unit shows '" + original + "'", "",
+                                   "Before the test the unit shows “" + original + "”, but the Excel default is “" + row.Default + "”: the unit is not at its default, or the Excel default is wrong.",
+                                   original, row.Default, original));
+            _stopRequested |= _stopOnFail;
+        }
+
         _params++;
+        int inputs0 = _inputs, passed0 = _passed, findings0 = _findings.Count;
         bool isString = tip.TypeToken.Equals("String", StringComparison.OrdinalIgnoreCase) || !double.TryParse(original, NumberStyles.Float, CultureInfo.InvariantCulture, out _);
         var inputs = new List<(string text, Expect expect, string what)>();
         if (isString)
@@ -493,6 +505,9 @@ public class ConfigureInputValidationTest
             _log("WARN  | " + row.Label + " | after the checks the field shows '" + now + "' instead of '" + original + "' - Fetch to read the unit again");
             FetchDiscard(window);
         }
+
+        // the end of this parameter's block: the next parameter starts after the separator line
+        _log("INFO  | " + row.Label + " | all validations of this parameter done: " + (_inputs - inputs0) + " inputs, " + (_passed - passed0) + " passed, " + (_findings.Count - findings0) + " failed");
     }
 
     // record=false: a failing result is NOT counted/logged (used for the first try of a value that must be ACCEPTED, which is repeated once); returns whether the result was as expected.
@@ -505,11 +520,23 @@ public class ConfigureInputValidationTest
         var tb = FindValueElement(window, row)!;
         At("typing '" + (text.Length > 20 ? text.Substring(0, 20) + "..." : text) + "'");
         TypeAndEnter(tb, text);
-        bool chip = WaitForRejectChip(window, row, RejectWaitMs);
+        bool chip = WaitForReject(window, row, RejectWaitMs, () => NewGuiErrors(before).Length > 0, () => SameText(DisplayedValue(window, row, FindValueElement(window, row) ?? tb), text),
+                                  out bool seenX, out bool seenV);
         tb = FindValueElement(window, row) ?? tb;
         string shown = DisplayedValue(window, row, tb);
-        string guiLog = NewGuiErrors(before);
+        if (!chip && SameText(shown, text))
+        {
+            // The box shows what was typed - that proves nothing: a refused or an ignored input (an empty one) stays in the box, and the green V can be left over
+            // from the previous input. Only the UNIT tells whether the value was taken: read the row from the unit again.
+            string fromUnit = ReadFromUnit(window, row);
+            if (fromUnit != null)
+            {
+                shown = fromUnit;
+                tb = FindValueElement(window, row) ?? tb;
+            }
+        }
 
+        string guiLog = NewGuiErrors(before);
         bool accepted = !chip && SameText(shown, text);
         string actual = chip ? "REJECTED (red X / last accepted value shown)" : accepted ? "ACCEPTED (value taken)" : "no red X, but the field shows '" + shown + "'";
         bool ok = expect switch
@@ -519,6 +546,7 @@ public class ConfigureInputValidationTest
             _ => chip || !SameText(shown, text) || shown.Length <= (int)(tip.Max ?? int.MaxValue),     // refused, or cut to the maximum length
         };
         string expected = expect switch { Expect.Reject => "REJECTED", Expect.Accept => "ACCEPTED", _ => "REJECTED or cut to Max" };
+        string icons = " | icons: red X=" + (seenX ? "YES" : "no") + ", green V=" + (seenV ? "yes" : "no");
 
         if (!ok && !record)
         {
@@ -542,11 +570,11 @@ public class ConfigureInputValidationTest
         if (ok)
         {
             _passed++;
-            _log("PASS  | " + row.Label + " | " + what + " '" + shownText + "' | expected " + expected + " | " + actual + (guiLog.Length > 0 ? " | GUI log: " + guiLog : ""));
+            _log("PASS  | " + row.Label + " | " + what + " '" + shownText + "' | expected " + expected + " | " + actual + icons + (guiLog.Length > 0 ? " | GUI log: " + guiLog : ""));
         }
         else
         {
-            _log("FAIL  | " + row.Label + " | " + what + " '" + shownText + "' | expected " + expected + " | " + actual + (guiLog.Length > 0 ? " | GUI log: " + guiLog : "")
+            _log("FAIL  | " + row.Label + " | " + what + " '" + shownText + "' | expected " + expected + " | " + actual + icons + (guiLog.Length > 0 ? " | GUI log: " + guiLog : "")
                  + (expect == Expect.Reject && accepted ? " | THE UNIT HELD THIS INVALID VALUE until it was put back" : ""));
             AddFinding(new Finding(row, what + " '" + shownText + "'", expected, actual, guiLog, Problem(what, text, expect, expected, actual), original, shownText, chip ? RejectChipText(tb) : shown));
             _failInARow++;
@@ -569,6 +597,7 @@ public class ConfigureInputValidationTest
         // clears the red X, ~0.5 s) is enough; after an accepted value the unit holds the typed value, so the original is typed back.
         if (chip)
         {
+            string unitValueChip = RejectChipText(FindValueElement(window, row) ?? tb);      // what the unit holds, as the GUI shows it next to the red X
             ClearRejection(window, row);      // the row refresh reads the value from the UNIT
             if (expect != Expect.Accept)
             {
@@ -584,6 +613,38 @@ public class ConfigureInputValidationTest
                     }
 
                     Thread.Sleep(200);
+                }
+
+                if (!SameValue(held, original) && held.Length > 0)
+                {
+                    if (held.All(c => c == '?') && text.Any(c => c > 127))
+                    {
+                        // Refused non-ASCII text (Hebrew): the refresh shows "????" - that is how this GUI/unit shows it and it is correct, not a failure. The question marks are
+                        // deleted (Ctrl+A) and the original value is typed again.
+                        _log("NOTE  | " + row.Label + " | after refusing '" + shownText + "' the refresh shows '" + held + "' - this is how the GUI/unit shows refused non-ASCII text (not a failure); the original value is typed back");
+                        TypeAndEnter(FindValueElement(window, row) ?? tb, original);
+                        WaitForRejectChipGone(window, row, 3000);
+                        held = original;
+                    }
+                    else
+                    {
+                        // The field can still show the REFUSED text (this GUI does not revert it): that is not the unit. The unit's own value is the chip next to the red X, and a
+                        // Fetch reads every value from the unit again and resets the field - only a value that is still wrong after that counts.
+                        _log("NOTE  | " + row.Label + " | the field still shows '" + held + "' after the refusal" + (unitValueChip.Length > 0 ? " (next to the red X the unit reports '" + unitValueChip + "')" : "")
+                             + " - reading the unit again (Fetch)");
+                        FetchDiscard(window);
+                        for (int i = 0; i < 8; i++)
+                        {
+                            var again = FindValueElement(window, row);
+                            held = again == null ? "" : DisplayedValue(window, row, again);
+                            if (SameValue(held, original))
+                            {
+                                break;
+                            }
+
+                            Thread.Sleep(200);
+                        }
+                    }
                 }
 
                 if (!SameValue(held, original) && held.Length > 0)
@@ -718,26 +779,9 @@ public class ConfigureInputValidationTest
         return e;
     }
 
-    // The "chip": a visible text to the RIGHT of the field that is not a labelled element - it shows the last value the unit accepted next to the red X.
-    private static bool HasRejectChip(AutomationElement valueEl)
-    {
-        try
-        {
-            var item = RowItem(valueEl);
-            if (item == null)
-            {
-                return false;
-            }
-
-            double right = valueEl.BoundingRectangle.Right;
-            return Walk(item, 0).Any(t => t.ControlType == ControlType.Text && string.IsNullOrEmpty(t.AutomationId) && !string.IsNullOrWhiteSpace(t.Name)
-                                          && !t.Properties.IsOffscreen.ValueOrDefault && t.BoundingRectangle.Width > 0 && t.BoundingRectangle.X >= right - 2);
-        }
-        catch
-        {
-            return false;
-        }
-    }
+    // Is the red X shown next to the field? (an icon, found by its colour - see RowIcons). The GUI shows the unit's own value in a chip next to the field after a
+    // set, also when the value was accepted (GUI 2.1.2-beta.2), so the chip text alone does not tell; the red X does.
+    private static bool HasRejectChip(AutomationElement valueEl) => RowIcons.Read(valueEl).RedX;
 
     // The text of the chip (what the unit holds, e.g. "-1" or the last accepted value), "" when there is none.
     private static string RejectChipText(AutomationElement valueEl)
@@ -759,6 +803,55 @@ public class ConfigureInputValidationTest
         {
             return "";
         }
+    }
+
+    // The row's own refresh button reads the value from the UNIT again; returns what the field shows afterwards (null = the button is not available).
+    private string? ReadFromUnit(Window window, Row row)
+    {
+        var list = window.FindFirstDescendant(cf => cf.ByAutomationId("ParametersList"));
+        var refresh = list?.FindFirstDescendant(cf => cf.ByAutomationId(row.NameId + "Refresh"));
+        if (refresh == null || !refresh.IsEnabled)
+        {
+            return null;
+        }
+
+        refresh.AsButton().Invoke();
+        Thread.Sleep(900);
+        var tb = FindValueElement(window, row);
+        return tb == null ? null : DisplayedValue(window, row, tb);
+    }
+
+    // The verdict on a typed value from the icons the GUI shows: a green V = accepted, a red X on its own = refused. A red X that was left over from the PREVIOUS
+    // input is seen at once, before the GUI has answered the new one, so a red X without the GUI's own error counts only after 1 s; and when both icons or none
+    // are shown at the end, the red X counts only if the GUI logged an error or the field does not hold the typed value.
+    private bool WaitForReject(Window window, Row row, int timeoutMs, Func<bool> guiError, Func<bool> fieldHasTyped, out bool seenX, out bool seenV)
+    {
+        var sw = Stopwatch.StartNew();
+        Thread.Sleep(250);
+        seenX = false;
+        seenV = false;
+        while (sw.ElapsedMilliseconds < timeoutMs)
+        {
+            var tb = FindValueElement(window, row);
+            if (tb != null)
+            {
+                (seenX, seenV) = RowIcons.Read(tb);
+            }
+
+            if (seenV && !seenX)
+            {
+                return false;
+            }
+
+            if (seenX && !seenV && (sw.ElapsedMilliseconds >= 1000 || guiError()))
+            {
+                return true;
+            }
+
+            Thread.Sleep(120);
+        }
+
+        return seenX && (guiError() || !fieldHasTyped());
     }
 
     private bool WaitForRejectChip(Window window, Row row, int timeoutMs)

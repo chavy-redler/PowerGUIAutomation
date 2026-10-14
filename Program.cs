@@ -13,7 +13,15 @@ string logPath = Path.Combine(AppContext.BaseDirectory, "GUIAutomationLog_" + Da
 void Log(string line)
 {
     string stamped = DateTime.Now.ToString("HH:mm:ss.fff") + "  " + line;
-    if (line.StartsWith("DRAW", StringComparison.Ordinal))
+    if (line.StartsWith("ROUND", StringComparison.Ordinal))
+    {
+        string bar = new string('=', 100);
+        File.AppendAllText(logPath, Environment.NewLine + bar + Environment.NewLine + stamped + Environment.NewLine + bar + Environment.NewLine, new System.Text.UTF8Encoding(true));
+        PrintColored(stamped, line);
+        return;
+    }
+
+    if (line.StartsWith("DRAW", StringComparison.Ordinal) || line.StartsWith("DONE", StringComparison.Ordinal))
     {
         // the log file gets the same separator between two parameters as the console
         File.AppendAllText(logPath, Environment.NewLine + new string('-', 100) + Environment.NewLine, new System.Text.UTF8Encoding(true));
@@ -53,8 +61,21 @@ void PrintColored(string stamped, string line)
     string time = stamped.Substring(0, 12);
     string rest = bar > 0 ? line.Substring(bar + 1).Trim() : "";
 
+    if (tag == "DONE")
+    {
+        // the last parameter's block ends with the same separator line as every other
+        Console.WriteLine();
+        Write(new string('-', 100), ConsoleColor.DarkGray);
+    }
+
     switch (tag)
     {
+        case "ROUND":
+            Console.WriteLine();
+            Write(new string('=', 100), ConsoleColor.Cyan);
+            Write(time + "  " + rest, ConsoleColor.Cyan);
+            Write(new string('=', 100), ConsoleColor.Cyan);
+            return;
         case "DRAW":
             Console.WriteLine();
             Write(new string('-', 100), ConsoleColor.DarkGray);
@@ -117,27 +138,20 @@ Log("SESSION START | PowerGUIAutomation launched");
 // test is easy to find when searching the logs afterwards.
 void ShowTestBanner(string? choice, UnitProfile? bannerUnit)
 {
-    string? title = choice?.Trim() switch
-    {
-        "1" => "OPERATE - SECOND BAR (UNIT INFO BAR) COMPARISON",
-        "2" => "CONFIGURE - PARAMETERS COMPARISON",
-        "3" => "CONFIGURE - CHANGE AND RESTORE EVERY PARAMETER",
-        "4" => "CONFIGURE - INPUT VALIDATION (INVALID VALUES MUST BE REJECTED)",
-        "5" => "DEBUG TESTS (READ-ONLY)",
-        _ => null,
-    };
+    string? title = TestInstructions.BannerTitle(choice);
     if (title == null)
     {
         return;
     }
 
     string unitText = "Unit: " + (bannerUnit?.Name ?? "(none selected)") + "   |   " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
-    int width = Math.Max(Math.Max(title.Length, unitText.Length) + 6, 64);
+    string titleLine = "TEST RUNNER: " + title;
+    int width = Math.Max(Math.Max(titleLine.Length, unitText.Length) + 6, 64);      // the box is as wide as its longest line
     string Line(string t) => "║  " + t.PadRight(width - 4) + "║";
     string[] box =
     {
         "╔" + new string('═', width - 2) + "╗",
-        Line("TEST RUNNER: " + title),
+        Line(titleLine),
         Line(unitText),
         "╚" + new string('═', width - 2) + "╝",
     };
@@ -158,8 +172,7 @@ void ShowTestBanner(string? choice, UnitProfile? bannerUnit)
 // The "before you start" frame (TestInstructions.cs) for the chosen test: console in color, log file as plain lines.
 void ShowInstructions(string choice, UnitProfile? instructionUnit)
 {
-    string sheetNote = instructionUnit == null ? "" : "Its sheet '" + instructionUnit.ParameterSheet + "' must exist and be valid.";
-    var lines = TestInstructions.Build(choice, instructionUnit, sheetNote);
+    var lines = TestInstructions.Build(choice, instructionUnit);
     Console.OutputEncoding = System.Text.Encoding.UTF8;
     foreach (var (text, color) in lines)
     {
@@ -306,11 +319,11 @@ while (true)
     {
         Console.WriteLine();
         Console.WriteLine("=== Power GUI Automation === | Unit: " + (unit?.Name ?? "(none selected)"));
-        Console.WriteLine("1. Operate - Second Bar (unit info bar) comparison");
-        Console.WriteLine("2. Configure - Parameters comparison");
-        Console.WriteLine("3. Configure - Change and restore every parameter (writes to the unit)");
-        Console.WriteLine("4. Configure - Input validation (types invalid values, never saves to flash)");
-        Console.WriteLine("5. Debug tests (read-only): Configure comparison on chosen channels / parameters, AutomationId scan");
+        foreach (var menuLine in TestInstructions.MenuLines)
+        {
+            Console.WriteLine(menuLine);
+        }
+
         Console.WriteLine("U. Change the unit under test");
         Console.WriteLine("0. Exit");
         FlushConsoleInput();
@@ -333,7 +346,8 @@ while (true)
     Log("MENU | choice selected: " + choice);
     ShowTestBanner(choice, unit);
     RunClock.Reset();
-    if (choice.Trim() is "1" or "2" or "3" or "4" or "5")
+    TestInstructions.Current = TestInstructions.IsTest(choice) ? choice.Trim() : "";
+    if (TestInstructions.IsTest(choice))
     {
         ShowInstructions(choice.Trim(), unit);
         if (!nonInteractive)
@@ -347,28 +361,15 @@ while (true)
         }
     }
 
-    if (choice.Trim() is "1" or "2" or "3" or "4" or "5")
+    if (TestInstructions.IsTest(choice))
     {
-        StopControl.Start(Log, graceful: choice.Trim() is "3" or "4");
+        StopControl.Start(Log, graceful: TestInstructions.IsGraceful(choice));
+        KeepAwake.On();
     }
 
     switch (choice)
     {
         case "1":
-            try
-            {
-                if (!MasterOk()) { break; }
-                RunClock.Start();
-                var test = new OperateSecondBarTest(ExcelPath, Log);
-                bool passed = test.Run();
-                Log(passed ? "=== TEST PASSED ===" : "=== TEST FAILED ===");
-            }
-            catch (Exception ex)
-            {
-                Log("FAIL | Unhandled error (" + ex.GetType().Name + "): " + ex.Message + " | at " + ex.StackTrace?.Split(Environment.NewLine).FirstOrDefault()?.Trim());
-            }
-            break;
-        case "2":
             try
             {
                 if (unit == null) { Log("FAIL | no unit selected - choose the unit (part number) first: press U, or pass unit=RD152"); break; }
@@ -383,7 +384,7 @@ while (true)
                 Log("FAIL | Unhandled error (" + ex.GetType().Name + "): " + ex.Message + " | at " + ex.StackTrace?.Split(Environment.NewLine).FirstOrDefault()?.Trim());
             }
             break;
-        case "3":
+        case "2":
             try
             {
                 if (unit == null) { Log("FAIL | no unit selected - choose the unit (part number) first: press U, or pass unit=RD152"); break; }
@@ -398,7 +399,7 @@ while (true)
                 Log("FAIL | Unhandled error (" + ex.GetType().Name + "): " + ex.Message + " | at " + ex.StackTrace?.Split(Environment.NewLine).FirstOrDefault()?.Trim());
             }
             break;
-        case "4":
+        case "3":
             try
             {
                 if (unit == null) { Log("FAIL | no unit selected - choose the unit (part number) first: press U, or pass unit=RD152"); break; }
@@ -413,7 +414,7 @@ while (true)
                 Log("FAIL | Unhandled error (" + ex.GetType().Name + "): " + ex.Message + " | at " + ex.StackTrace?.Split(Environment.NewLine).FirstOrDefault()?.Trim());
             }
             break;
-        case "5":
+        case "4":
             try
             {
                 if (unit == null) { Log("FAIL | no unit selected - choose the unit (part number) first: press U, or pass unit=RD152"); break; }
@@ -434,7 +435,8 @@ while (true)
     }
 
     StopControl.Stop();
-    if (choice.Trim() is "1" or "2" or "3" or "4" or "5")
+    KeepAwake.Off();
+    if (TestInstructions.IsTest(choice))
     {
         ShowTookLine(choice.Trim(), unit);
     }
