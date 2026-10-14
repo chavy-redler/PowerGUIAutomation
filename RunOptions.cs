@@ -73,15 +73,26 @@ public sealed class RowSelection
     // The question every Configure test asks: which Excel rows to run. Besides "54-70, 72, 100-" the answer can be the PATH of a failures file
     // (drag the file into the console window): then ONLY the rows listed in its "Failed" sheet run. Returns null = every row.
     // 'description' says where the rows came from (for the START line of the log).
-    public static RowSelection? Ask(string filePrefix, string partNumber, out string description)
+    // number > 0: the question is drawn as "Question <number> of <total>" (see StartQuestions); 0 = the plain old layout (debug tests).
+    public static RowSelection? Ask(string filePrefix, string partNumber, out string description, int number = 0, int total = StartQuestions.Total)
     {
         while (true)
         {
-            Console.WriteLine("Excel rows to run:");
-            Console.WriteLine("  Enter = all rows,  or e.g.  54-70, 72, 100-    (54-70 = rows 54 to 70;  100- = from row 100 to the end of the sheet;  -60 = from the first row up to row 60)");
-            Console.WriteLine("  Only the FAILED rows of an earlier run: drag its failures file (.xlsx) into this window, or paste its path.");
-            Console.WriteLine("  The failures files are in: " + RunReport.Dir);
-            Console.Write("Rows or failures file: ");
+            if (number > 0)
+            {
+                StartQuestions.Header(number, total, "Which Excel rows to run");
+            }
+            else
+            {
+                Console.WriteLine("Excel rows to run:");
+            }
+
+            Console.WriteLine("   Enter             = all rows");
+            Console.WriteLine("   54-70, 72, 100-   = rows 54 to 70, row 72, and row 100 to the end of the sheet");
+            Console.WriteLine("   -60               = from the first row up to row 60");
+            Console.WriteLine("   a failures file   = only the FAILED rows of an earlier run: drag its .xlsx into this window, or paste its path");
+            Console.WriteLine("                       (the failures files are in: " + RunReport.Dir + ")");
+            Console.Write(" Rows or failures file [Enter = all]: ");
             string? answer = Console.ReadLine();
             string text = (answer ?? "").Trim().Trim('"');
             if (text.Equals("F", StringComparison.OrdinalIgnoreCase))

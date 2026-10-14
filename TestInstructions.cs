@@ -10,6 +10,9 @@ public static class TestInstructions
     private const int KeyWidth = 22;
     private const int ValueWidth = 82;
 
+    // The "Loop / overnight" row of every test that can loop (tests 2 and 3): the same text, kept once.
+    private const string LoopNote = "At the start you can run it in a LOOP (N rounds, or round after round until you stop it, with an optional time limit): every round is announced in the log and every failure says its round. For an overnight run: disable Windows sleep, the lock screen and the screen saver (the test keeps the PC and the display awake but cannot unlock a locked screen), keep the unit powered, choose 'continue' on failure.";
+
     private sealed record Item(string Key, string Value);
 
     // Configure = the test reads limits from the tooltips and needs the up-to-date DB. Graceful = the test can stop cleanly between parameters (see
@@ -25,12 +28,12 @@ public static class TestInstructions
         new("2", "Configure - Change and restore every parameter", "CONFIGURE - CHANGE AND RESTORE EVERY PARAMETER", true, true,
             "WRITES to the unit and saves to flash: every parameter is changed, saved, read back, put back to the value it had (its default after the reset) and checked against the Excel default. Never changed: baud rates, addresses, Logic, Group Control.",
             StopRisk: "the parameter being tested may stay on a changed value, it is listed in the failures file - check it on the unit.",
-            Extra: new[] { ("Loop / overnight", "At the start you can run it in a LOOP (N rounds, or round after round until you stop it, with an optional time limit): every round is announced in the log and every failure says its round. For an overnight run: disable Windows sleep, the lock screen and the screen saver (the test keeps the PC and the display awake but cannot unlock a locked screen), keep the unit powered, choose 'continue' on failure.") },
+            Extra: new[] { ("Loop / overnight", LoopNote) },
             Menu: "Configure - Change and restore every parameter (writes to the unit)"),
         new("3", "Configure - Input validation", "CONFIGURE - INPUT VALIDATION (INVALID VALUES MUST BE REJECTED)", true, true,
             "Types invalid values (letters, empty, Min-1, Max+1, Hebrew, too-long text) into the text fields of every System and channel parameter (all rows, or the rows you choose), and checks that the GUI refuses them, and that valid ones (Min, Max, text) are accepted. NEVER presses Save; the original value is put back after every input.",
             StopRisk: "a value typed at that moment (Enter applies it, nothing is saved) may still be on the unit - check the parameter listed in the failures file.",
-            Extra: new[] { ("GUI version", "Developed on Power Rider Studio 2.1.2 or newer; on an older GUI the results are not validated.") },
+            Extra: new[] { ("GUI version", "Developed on Power Rider Studio 2.1.2 or newer; on an older GUI the results are not validated."), ("Loop / overnight", LoopNote) },
             Menu: "Configure - Input validation (types invalid values, never saves to flash)"),
         new("4", "Debug tests", "DEBUG TESTS", true, false,
             "1 = test 1 only on chosen channels / parameters (read-only);  2 = AutomationId scan of all parameters (read-only, report to a new workbook in the Excel folder);  3 = LOOP: test 2's change-and-restore on a group of parameters, round after round until you stop it or one hour has passed (WRITES to the unit; the stop key then stops after the parameter that is being checked).",

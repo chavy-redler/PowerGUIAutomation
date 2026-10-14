@@ -557,27 +557,9 @@ public class ConfigureChangeAndRestoreAllParametersTest
         }
         else
         {
-            Console.WriteLine("When a parameter fails:");
-            Console.WriteLine("  1. stop at the first failure  [default]");
-            Console.WriteLine("  2. continue with the next parameter; every failure is listed at the end (and in the Failures folder)");
-            Console.Write("Choice [1]: ");
-            _stopOnFail = (Console.ReadLine() ?? "").Trim() != "2";
-
-            selection = RowSelection.Ask(FilePrefix, _unit.PartNumber, out _rowsDescription);
-
-            Console.WriteLine("Loop (repeat the whole run):");
-            Console.Write("  Enter = run once,  N = N rounds,  0 = round after round until you stop it: ");
-            string loopText = (Console.ReadLine() ?? "").Trim();
-            if (int.TryParse(loopText, out int loopRounds) && loopRounds != 1)
-            {
-                _unlimited = loopRounds <= 0;
-                _rounds = Math.Max(1, loopRounds);
-                Console.Write("  Stop automatically after how many hours? (Enter = no limit): ");
-                if (double.TryParse((Console.ReadLine() ?? "").Trim().Replace(',', '.'), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out double hours) && hours > 0)
-                {
-                    _timeLimit = TimeSpan.FromHours(hours);
-                }
-            }
+            _stopOnFail = StartQuestions.AskStopOnFail("parameter");
+            selection = RowSelection.Ask(FilePrefix, _unit.PartNumber, out _rowsDescription, 2);
+            StartQuestions.AskLoop(out _rounds, out _unlimited, out _timeLimit);
         }
 
         Console.WriteLine();

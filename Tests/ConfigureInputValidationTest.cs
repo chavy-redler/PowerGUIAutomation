@@ -22,7 +22,8 @@ namespace PowerGUIAutomation.Tests;
 //
 // Per parameter (text fields only; ComboBoxes have nothing to type):
 //   number with Min/Max : Max+1 and Min-1 must be rejected, "abc" must be rejected, empty must be rejected, Max and Min must be accepted
-//                         (the two accepted ones only when the constraint does not depend on another parameter)
+//                         (when the constraint depends on another parameter: "must be lower than" -> only Min; "must be higher than" -> Max as is, and Min
+//                         while the other parameter is temporarily set to its own Min and put back afterwards)
 //   number, no range    : "abc" and empty must be rejected
 //   text                : Hebrew letters must be rejected, empty must be rejected (Min >= 1), Max+1 characters must be rejected or cut to
 //                         Max, a normal text with English letters, digits, space and symbols must be accepted
@@ -54,7 +55,24 @@ public class ConfigureInputValidationTest
         public string Label => (Channel > 0 ? "Channel " + Channel + " | " : "System | ") + Name + " (" + Sheet + " row " + ExcelRow + ")";
     }
 
-    private sealed record Finding(Row Row, string Input, string Expected, string Actual, string GuiLog, string Problem, string Original = "", string Typed = "", string Shown = "");
+    private sealed record Finding(Row Row, string Input, string Expected, string Actual, string GuiLog, string Problem, string Original = "", string Typed = "", string Shown = "")
+    {
+        public int Round { get; init; }                      // the loop round (0 = not a loop)
+        public DateTime At { get; init; } = DateTime.Now;    // when the failure happened (the "Run time" column)
+    }
+
+    // LOOP (like test 2): the whole run is repeated `_rounds` times, or round after round until the stop key (_unlimited), with an optional time limit. A failure that
+    // shows up only after many writes to the unit means the quantity is the problem and not the parameter.
+    private int _rounds = 1, _round;
+    private bool _unlimited;
+    private TimeSpan? _timeLimit;
+    private bool Looping => _unlimited || _rounds > 1;
+    private string LoopText => !Looping ? "no loop (one pass)" : (_unlimited ? "round after round until stopped" : _rounds + " rounds") + (_timeLimit.HasValue ? ", time limit " + RunReport.Format(_timeLimit.Value) : "")
+                                                                  + "; rounds started: " + Math.Max(_round, 1);
+    private string RoundText => _unlimited ? "round " + _round : "round " + _round + " of " + _rounds;
+    private int _writes;                                     // values typed into the unit so far (every typed input and every put-back, Enter applies it)
+    private int _firstFailureWrites = -1;                    // writes done when the first failure came
+    private string _firstFailureWhere = "";
 
     private bool _stopOnFail = true;
     private bool _stopRequested;
@@ -103,6 +121,8 @@ public class ConfigureInputValidationTest
     private const string FilePrefix = "InputValidation";
     private RunReport? _report;
     private List<Row> _todo = new();
+    private List<Row> _allRows = new();                 // every row of the sheet (the other parameter of a "must be higher than ..." constraint may not be in the run)
+    private volatile string _tempChange = "";           // a parameter that is temporarily changed right now (the Min check of a "higher than" parameter); empty = none
     private int _finished;
     private Row? _current;
     private string _rowsDescription = "all";
@@ -111,6 +131,18 @@ public class ConfigureInputValidationTest
     // Recorded under the report's lock: ValidateOne runs on a worker thread and the Ctrl+C / console-close handler writes the workbook from another one.
     private void AddFinding(Finding f)
     {
+        f = f with { Round = Looping ? _round : 0 };
+        if (Looping)
+        {
+            f = f with { Problem = RoundText[0].ToString().ToUpperInvariant() + RoundText.Substring(1) + ", after " + _writes + " writes to the unit: " + f.Problem };
+        }
+
+        if (_firstFailureWrites < 0)
+        {
+            _firstFailureWrites = _writes;
+            _firstFailureWhere = f.Row.Label + (Looping ? ", " + RoundText : "");
+        }
+
         if (_report == null)
         {
             _findings.Add(f);
@@ -145,7 +177,8 @@ public class ConfigureInputValidationTest
             if (_current != null)
             {
                 _findings.Add(new Finding(_current, "(interrupted)", "-", "the run was stopped while this parameter was being checked", "",
-                                          "The test was stopped by user while modifying this parameter, please verify that the value is correct."));
+                                          "The test was stopped by user while modifying this parameter, please verify that the value is correct."
+                                          + (_tempChange.Length > 0 ? " It was also changing " + _tempChange + " temporarily - verify that one too." : "")) { Round = Looping ? _round : 0 });
             }
 
             report.Finish(status);
@@ -202,7 +235,7 @@ public class ConfigureInputValidationTest
                 {
                     lock (_report.Sync)
                     {
-                        _findings.Add(new Finding(_current, "(crash)", "-", ex.GetType().Name + ": " + ex.Message, "", "The test crashed while checking this parameter, please verify that the value is correct."));
+                        _findings.Add(new Finding(_current, "(crash)", "-", ex.GetType().Name + ": " + ex.Message, "", "The test crashed while checking this parameter, please verify that the value is correct.") { Round = Looping ? _round : 0 });
                     }
                 }
 
@@ -230,6 +263,7 @@ public class ConfigureInputValidationTest
         try
         {
             rows = ReadRows();
+            _allRows = rows;
         }
         catch (Exception ex)
         {
@@ -238,19 +272,14 @@ public class ConfigureInputValidationTest
         }
 
         _scopeRows = rows.GroupBy(r => r.Scope).ToDictionary(g => g.Key, g => g.OrderBy(r => r.ExcelRow).Select(r => r.ExcelRow).ToList());
-        Console.WriteLine();
-        Console.WriteLine("When an input fails:");
-        Console.WriteLine("  1. stop at the first failure  [default]");
-        Console.WriteLine("  2. continue; every failure is listed at the end (and in the Failures folder)");
-        Console.Write("Choice [1]: ");
-        _stopOnFail = (Console.ReadLine() ?? "").Trim() != "2";
+        _stopOnFail = StartQuestions.AskStopOnFail("input");
 
         var todo = rows.Where(r => r.Channel <= _unit.Channels
                                    && !NeverChange.Contains(r.Name) && !IsLogicParam(r.Name) && r.Scope != ConfigureNav.GroupScope
                                    && (onlyName.Length == 0 || r.Name.Contains(onlyName, StringComparison.OrdinalIgnoreCase))).ToList();
 
-        var selection = RowSelection.Ask(FilePrefix, _unit.PartNumber, out _rowsDescription);
-        Console.WriteLine();
+        var selection = RowSelection.Ask(FilePrefix, _unit.PartNumber, out _rowsDescription, 2);
+        StartQuestions.AskLoop(out _rounds, out _unlimited, out _timeLimit);
         if (selection != null)
         {
             todo = todo.Where(r => selection.Contains(r.ExcelRow)).ToList();
@@ -264,7 +293,8 @@ public class ConfigureInputValidationTest
 
         _log("START | Configure input validation | unit=" + _unit.Name + " | scope: System + all " + _unit.Channels + " channels"
              + " | parameters=" + todo.Count + (onlyName.Length > 0 ? " | only names containing '" + onlyName + "'" : "") + " | on failure: " + (_stopOnFail ? "stop" : "continue")
-             + " | rows: " + _rowsDescription + " | NOTHING is saved to flash");
+             + " | rows: " + _rowsDescription + " | NOTHING is saved to flash"
+             + (Looping ? " | LOOP: " + (_unlimited ? "round after round until you stop it" : _rounds + " rounds") + " of the same rows" : ""));
         if (selection?.SourceFile != null)
         {
             _log("INFO  | RE-RUN of the failed rows listed in: " + selection.SourceFile);
@@ -306,58 +336,83 @@ public class ConfigureInputValidationTest
         _logElement = window.FindFirstDescendant(cf => cf.ByAutomationId("ConfigureLog"));
         var watch = Stopwatch.StartNew();
         int index = 0;
-        foreach (var scope in todo.GroupBy(r => r.Scope))
+        for (int round = 1; _unlimited || round <= _rounds; round++)
         {
-            string? crumb = ConfigureNav.SelectScope(window, scope.Key);
-            if (crumb == null)
+            _round = round;
+            index = 0;
+            if (Looping)
             {
-                _log("FAIL  | the tree page of scope " + scope.Key + " could not be selected");
-                return false;
+                _log("ROUND | LOOP ROUND " + round + (_unlimited ? "" : " OF " + _rounds) + " STARTED | " + todo.Count + " parameters | failed parameters so far: " + _findings.Select(f => f.Row.ExcelRow).Distinct().Count()
+                     + " | writes to the unit so far: " + _writes + " | running for " + RunReport.Format(watch.Elapsed) + (_timeLimit.HasValue ? " (time limit " + RunReport.Format(_timeLimit.Value) + ")" : ""));
             }
 
-            foreach (var row in scope)
+            foreach (var scope in todo.GroupBy(r => r.Scope))
             {
-                if (StopControl.Requested)
+                string? crumb = ConfigureNav.SelectScope(window, scope.Key);
+                if (crumb == null)
                 {
-                    _endStatus = "Stopped by the user (stop key) after finishing the last parameter";
-                    _log("STOPPED | the stop key was pressed - the run stops here, the last parameter was finished and its original value is back");
-                    _log("RESUME| to continue later answer 'Excel rows to run' with:  " + row.ExcelRow + "-  (from this parameter to the end)");
-                    goto Summary;
+                    _log("FAIL  | the tree page of scope " + scope.Key + " could not be selected");
+                    return false;
                 }
 
-                index++;
-                _current = row;
-                _log("DRAW  | " + index + "/" + todo.Count + " | " + row.Label);
-                bool finished;
-                try
+                foreach (var row in scope)
                 {
-                    finished = RunWatched(() => ValidateOne(window, row));
-                }
-                catch (Exception ex)
-                {
-                    _log("WARN  | " + row.Label + " | interrupted (" + ex.GetType().Name + ": " + ex.Message + ") - the value is put back by a Fetch");
-                    FetchDiscard(window);
-                    finished = true;
-                }
+                    if (StopControl.Requested)
+                    {
+                        _endStatus = "Stopped by the user (stop key) after finishing the last parameter";
+                        _log("STOPPED | the stop key was pressed - the run stops here, the last parameter was finished and its original value is back");
+                        _log("RESUME| to continue later answer 'Excel rows to run' with:  " + row.ExcelRow + "-  (from this parameter to the end)");
+                        goto Summary;
+                    }
 
-                if (!finished)
-                {
-                    AddFinding(new Finding(row, "(stuck)", "no hang", "no progress for " + NoProgressMinutes + " min - last action: " + _where, "", "The test got stuck (no progress for " + NoProgressMinutes + " minutes, last action: " + _where + "), please verify that the value is correct."));
-                    _log("FAIL  | " + row.Label + " | STEP: " + _where + " | WHY: no progress for " + NoProgressMinutes + " minutes | CHECK: the GUI may be frozen or a UI call is not returning; check the unit and the GUI");
-                    _stopRequested = true;
-                }
+                    if (_timeLimit.HasValue && watch.Elapsed >= _timeLimit.Value)
+                    {
+                        // the loop's time limit: the previous parameter is finished and its original value is back, nothing is half done
+                        _endStatus = "Completed - the time limit of " + RunReport.Format(_timeLimit.Value) + " was reached";
+                        _log("STOPPED | the time limit of " + RunReport.Format(_timeLimit.Value) + " was reached - the run stops here, the last parameter was finished and its original value is back");
+                        goto Summary;
+                    }
 
-                _current = null;
-                _finished = index;
-                if (_stopRequested)
-                {
-                    _endStatus = !finished ? "Stopped - stuck (no progress for " + NoProgressMinutes + " minutes)"
-                               : _stopOnFail ? "Stopped after the first failing input"
-                               : "Stopped - " + _failInARow + " failing inputs in a row (unit or GUI problem?)";
-                    _log("STOPPED | " + (finished ? "halted after the first failing input" : "the run is stuck and cannot continue safely") + " - remaining parameters were not checked");
-                    _log("RESUME| to continue later answer 'Excel rows to run' with:  " + row.ExcelRow + "-  (this parameter again)   or give the failures file (only its failed rows)");
-                    goto Summary;
+                    index++;
+                    _current = row;
+                    _log("DRAW  | " + (Looping ? RoundText + " | " : "") + index + "/" + todo.Count + " | " + row.Label);
+                    bool finished;
+                    try
+                    {
+                        finished = RunWatched(() => ValidateOne(window, row));
+                    }
+                    catch (Exception ex)
+                    {
+                        _log("WARN  | " + row.Label + " | interrupted (" + ex.GetType().Name + ": " + ex.Message + ") - the value is put back by a Fetch");
+                        FetchDiscard(window);
+                        finished = true;
+                    }
+
+                    if (!finished)
+                    {
+                        AddFinding(new Finding(row, "(stuck)", "no hang", "no progress for " + NoProgressMinutes + " min - last action: " + _where, "", "The test got stuck (no progress for " + NoProgressMinutes + " minutes, last action: " + _where + "), please verify that the value is correct."));
+                        _log("FAIL  | " + row.Label + " | STEP: " + _where + " | WHY: no progress for " + NoProgressMinutes + " minutes | CHECK: the GUI may be frozen or a UI call is not returning; check the unit and the GUI");
+                        _stopRequested = true;
+                    }
+
+                    _current = null;
+                    _finished = index;
+                    if (_stopRequested)
+                    {
+                        _endStatus = !finished ? "Stopped - stuck (no progress for " + NoProgressMinutes + " minutes)"
+                                   : _stopOnFail ? "Stopped after the first failing input"
+                                   : "Stopped - " + _failInARow + " failing inputs in a row (unit or GUI problem?)";
+                        _log("STOPPED | " + (finished ? "halted after the first failing input" : "the run is stuck and cannot continue safely") + " - remaining parameters were not checked");
+                        _log("RESUME| to continue later answer 'Excel rows to run' with:  " + row.ExcelRow + "-  (this parameter again)   or give the failures file (only its failed rows)");
+                        goto Summary;
+                    }
                 }
+            }
+
+            if (Looping)
+            {
+                _log("ROUND | LOOP ROUND " + round + (_unlimited ? "" : " OF " + _rounds) + " FINISHED | parameters checked=" + _params + " inputs checked=" + _inputs + " passed=" + _passed + " failures=" + _findings.Count
+                     + " | writes to the unit so far: " + _writes + " | " + RunReport.Format(watch.Elapsed));
             }
         }
 
@@ -368,6 +423,12 @@ public class ConfigureInputValidationTest
         _log("RESULT| " + new string('=', 90));
         _log("RESULT| " + (_findings.Count == 0 ? "PASSED" : "FAILED") + " | unit=" + _unit.Name + " | inputs checked=" + _inputs + " | failures=" + _findings.Count + " | mode=" + (_stopOnFail ? "stop on fail" : "continue"));
         _log("RESULT| status          : " + _report.Status);
+        if (Looping)
+        {
+            _log("RESULT| loop            : " + _round + (_unlimited ? "" : " of " + _rounds) + " rounds started, " + _writes + " writes to the unit in total; "
+                 + (_firstFailureWrites >= 0 ? "the FIRST failure came after " + _firstFailureWrites + " writes (" + _firstFailureWhere + ")" : "no failure"));
+        }
+
         _log("RESULT| total run time  : " + RunReport.Format(_report.Elapsed) + "  (" + _report.Started.ToString("HH:mm:ss") + " - " + (_report.Ended ?? DateTime.Now).ToString("HH:mm:ss") + ")");
         foreach (var g in _findings.GroupBy(x => x.Row.ExcelRow))
         {
@@ -408,7 +469,7 @@ public class ConfigureInputValidationTest
         string original = DisplayedValue(window, row, tb);
         var tip = ReadConstraints(tb);
         _log("READ  | " + row.Label + " | current='" + original + "' | constraints: Min=" + Fmt(tip.Min) + " Max=" + Fmt(tip.Max) + " unit/type=" + tip.TypeToken
-             + (tip.Direction.Length > 0 ? " | must be " + tip.Direction + " than another parameter (only the " + (tip.Direction == "lower" ? "Min" : "Max") + " limit is typed as a valid value)" : ""));
+             + (tip.Direction.Length > 0 ? " | must be " + tip.Direction + " than another parameter (" + (tip.Direction == "lower" ? "only the Min limit is typed as a valid value" : "Max is typed as is; Min is typed while the other parameter is temporarily at its minimum") + ")" : ""));
         if (original.Length == 0)
         {
             _skippedParams++;
@@ -489,6 +550,11 @@ public class ConfigureInputValidationTest
             {
                 break;       // the original value has been put back by CheckInput; the run stops after this parameter
             }
+        }
+
+        if (tip.Direction == "higher" && tip.Min.HasValue && !_stopRequested && !StopControl.Requested)
+        {
+            CheckMinWithOtherAtItsMinimum(window, row, original, tip);
         }
 
         // the original is typed back after every input; make sure the unit really shows it again
@@ -669,6 +735,84 @@ public class ConfigureInputValidationTest
         return ok;
     }
 
+    // "must be higher than <other>" (Vin1 High Threshold Px vs Vin1 Low Threshold): the Min limit of this parameter can only be accepted while <other> is below it, and
+    // <other> can go no lower than ITS Min - so <other> is set to its Min for this one input, the Min is typed (must be ACCEPTED), and <other> is put back (also on an error).
+    // If the unit refuses Min here (e.g. both Min are 8 and "higher" is strict) it is reported as a failure of the Min input.
+    private void CheckMinWithOtherAtItsMinimum(Window window, Row row, string original, Tip tip)
+    {
+        var other = _allRows.Where(r => r.Sheet == row.Sheet && r.Channel == row.Channel && tip.Other.StartsWith(r.Name, StringComparison.OrdinalIgnoreCase))
+                            .OrderByDescending(r => r.Name.Length).FirstOrDefault();
+        if (other == null || other.Scope != row.Scope)
+        {
+            _log("NOTE  | " + row.Label + " | the Min limit was not checked: the other parameter ('" + tip.Other + "') is not on this page of the sheet");
+            return;
+        }
+
+        var otherTb = FindValueElement(window, other);
+        string otherOriginal = otherTb == null ? "" : DisplayedValue(window, other, otherTb);
+        var otherTip = otherTb == null ? new Tip() : ReadConstraints(otherTb);
+        if (otherTb == null || otherOriginal.Length == 0 || !otherTip.Min.HasValue)
+        {
+            _log("NOTE  | " + row.Label + " | the Min limit was not checked: the value or the Min of '" + other.Name + "' could not be read");
+            return;
+        }
+
+        string otherMin = Fmt(otherTip.Min);
+        _tempChange = other.Label + " (original '" + otherOriginal + "')";
+        try
+        {
+            At("setting " + other.Name + " to its minimum " + otherMin);
+            TypeAndEnter(otherTb, otherMin);
+            Thread.Sleep(600);
+            string got = ReadFromUnit(window, other) ?? DisplayedValue(window, other, FindValueElement(window, other) ?? otherTb);
+            if (!SameValue(got, otherMin))
+            {
+                _log("WARN  | " + row.Label + " | the Min limit was not checked: " + other.Name + " could not be set to its minimum " + otherMin + " (the unit holds '" + got + "')");
+                return;
+            }
+
+            _log("INFO  | " + row.Label + " | " + other.Name + " temporarily set to its minimum " + otherMin + " (original '" + otherOriginal + "') to check the Min limit");
+            string what = "Min (the limit itself) [" + other.Name + " temporarily set to its minimum " + otherMin + "]";
+            string text = Fmt(tip.Min);
+            if (!CheckInput(window, row, original, text, Expect.Accept, what, tip, record: false))
+            {
+                _log("NOTE  | " + row.Label + " | " + what + " '" + text + "' was refused - trying once more");
+                CheckInput(window, row, original, text, Expect.Accept, what, tip);
+            }
+        }
+        finally
+        {
+            At("putting " + other.Name + " back");
+            var tb = FindValueElement(window, other);
+            if (tb != null)
+            {
+                ClearRejection(window, other);
+                TypeAndEnter(FindValueElement(window, other) ?? tb, otherOriginal);
+                WaitForRejectChipGone(window, other, 3000);
+                ClearRejection(window, other);
+            }
+
+            string back = ReadFromUnit(window, other) ?? "";
+            if (!SameValue(back, otherOriginal))
+            {
+                FetchDiscard(window);
+                var again = FindValueElement(window, other);
+                back = again == null ? "" : DisplayedValue(window, other, again);
+            }
+
+            if (!SameValue(back, otherOriginal))
+            {
+                _log("FAIL  | " + other.Label + " | after the Min check of " + row.Name + " it shows '" + back + "' instead of the original '" + otherOriginal + "' - fix it on the unit");
+                AddFinding(new Finding(other, "(restore after the Min check of " + row.Name + ")", "the original value '" + otherOriginal + "'", "unit holds '" + back + "'", "",
+                                       "This parameter was temporarily set to its minimum to check " + row.Name + " and could not be put back: it holds “" + back + "” (original “" + otherOriginal + "”).",
+                                       otherOriginal, otherMin, back));
+                _stopRequested = true;
+            }
+
+            _tempChange = "";
+        }
+    }
+
     // The red X stays until the row is refreshed: press the row's "Refresh parameter value from unit" button (id = name id + "Refresh").
     private void ClearRejection(Window window, Row row)
     {
@@ -701,7 +845,11 @@ public class ConfigureInputValidationTest
     {
         string shown = text.Length > 20 ? text.Substring(0, 20) + "..." : text;
         if (what.StartsWith("Max (", StringComparison.Ordinal)) return "The field does not accept the maximum value (" + shown + ").";
-        if (what.StartsWith("Min (", StringComparison.Ordinal)) return "The field does not accept the minimum value (" + shown + ").";
+        if (what.StartsWith("Min (", StringComparison.Ordinal))
+        {
+            int ctx = what.IndexOf('[');      // "[Vin1 Low Threshold temporarily set to its minimum 8]" - the condition the value was typed under
+            return "The field does not accept the minimum value (" + shown + ")" + (ctx >= 0 ? " " + what.Substring(ctx) : "") + ".";
+        }
         if (what == "Max+1") return "The field accepts a value above the maximum (" + shown + ").";
         if (what == "Min-1") return "The field accepts a value below the minimum (" + shown + ").";
         if (what == "letters") return "The field accepts letters (“" + shown + "”).";
@@ -752,6 +900,7 @@ public class ConfigureInputValidationTest
         }
 
         Thread.Sleep(120);
+        Interlocked.Increment(ref _writes);      // Enter below applies the value to the unit
         Keyboard.TypeSimultaneously(VirtualKeyShort.CONTROL, VirtualKeyShort.KEY_A);
         if (text.Length == 0)
         {
@@ -951,6 +1100,7 @@ public class ConfigureInputValidationTest
         public double? Min, Max;
         public string TypeToken = "";
         public string Direction = "";      // "lower" / "higher" when the constraint says "must be lower/higher than <another parameter>"
+        public string Other = "";          // the text after "must be higher than" (starts with the other parameter's name, e.g. "Vin1 Low Threshold. ...")
     }
 
     private static readonly Regex ConstraintsRegex = new(@"Min:\s*(-?[\d.,]+)[^\w-]+Max:\s*(-?[\d.,]+)", RegexOptions.Compiled);
@@ -985,9 +1135,10 @@ public class ConfigureInputValidationTest
                     }
                 }
 
-                var dep = Regex.Match(c, @"must be\s+(lower|less|smaller|higher|greater|bigger)", RegexOptions.IgnoreCase);
+                var dep = Regex.Match(c, @"must be\s+(lower|less|smaller|higher|greater|bigger)\s+(?:than|then)?\s*([^\r\n]*)", RegexOptions.IgnoreCase);
                 if (dep.Success)
                 {
+                    tip.Other = dep.Groups[2].Value.Trim();
                     tip.Direction = dep.Groups[1].Value.ToLowerInvariant() is "lower" or "less" or "smaller" ? "lower" : "higher";
                 }
 
@@ -1150,6 +1301,11 @@ public class ConfigureInputValidationTest
                 using var wb = new XLWorkbook();
                 var ws = wb.AddWorksheet(RunReport.SheetFailed);
                 string[] head = { "Excel row", "Channel", "Parameter", "Failure type", "Previous value", "Value we tried to write", "Value read from the unit", "Unit", "GUI version", "Run time" };
+                if (Looping)
+                {
+                    head = head.Append("Loop round").ToArray();
+                }
+
                 for (int i = 0; i < head.Length; i++)
                 {
                     ws.Cell(1, i + 1).Value = head[i];
@@ -1168,7 +1324,12 @@ public class ConfigureInputValidationTest
                     ws.Cell(r, 7).Value = f.Shown;
                     ws.Cell(r, 8).Value = _unit.Name;
                     ws.Cell(r, 9).Value = _guiVersion;
-                    ws.Cell(r, 10).Value = DateTime.Now.ToString("yyyy-MM-dd HH:mm");
+                    ws.Cell(r, 10).Value = f.At.ToString("yyyy-MM-dd HH:mm");
+                    if (Looping)
+                    {
+                        ws.Cell(r, 11).Value = f.Round > 0 ? "Round " + f.Round + (_unlimited ? "" : " of " + _rounds) : "";
+                    }
+
                     r++;
                 }
 
@@ -1178,6 +1339,7 @@ public class ConfigureInputValidationTest
                 {
                     ("Unit", _unit.Name),
                     ("Rows of this run", _rowsDescription),
+                    ("Loop", LoopText),
                 });
                 report.Save(wb);
                 return report.Path;
