@@ -45,6 +45,13 @@ public class ConfigureInputValidationTest
         "CAN Bus Baud Rate", "Serial Baud Rate", "Destination Address", "Unit ID Address",
     };
 
+    // Dependencies the unit enforces but the DB tooltip does not state (the Vin ones are read from the tooltip: "must be higher then Vin1 Low Threshold").
+    private static readonly Dictionary<string, (string Direction, string Other)> KnownDependencies = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ["Temp Low Threshold"] = ("lower", "Temp High Threshold"),
+        ["Temp High Threshold"] = ("higher", "Temp Low Threshold"),
+    };
+
     private readonly string _excelPath;
     private readonly Action<string> _log;
     private readonly UnitProfile _unit;
@@ -77,6 +84,7 @@ public class ConfigureInputValidationTest
     private bool _stopOnFail = true;
     private bool _stopRequested;
     private string _guiVersion = "";
+    private string _dbInfo = "";      // which Studio DB the GUI runs with (see StudioDbInfo), shown in the log and the Run tab
     private const int MaxFailuresInARow = 10;      // continue mode: this many failing inputs in a row = something is wrong with the unit/GUI, stop
 
     // What the test is doing right now (heartbeat / "stuck" report); the run is declared stuck after NoProgressMinutes without a new step.
@@ -319,6 +327,7 @@ public class ConfigureInputValidationTest
         using var automation = new UIA3Automation();
         var window = AppConnection.Attach(automation);
         _window = window;
+        _dbInfo = StudioDbInfo.Report(window, _log);
         string? unitProblem = UnitCheck.Verify(window, _unit, _log);
         if (unitProblem != null)
         {
@@ -468,8 +477,14 @@ public class ConfigureInputValidationTest
 
         string original = DisplayedValue(window, row, tb);
         var tip = ReadConstraints(tb);
+        if (tip.Direction.Length == 0 && KnownDependencies.TryGetValue(row.Name, out var known))
+        {
+            tip.Direction = known.Direction;      // the DB tooltip does not say it, the unit does enforce it
+            tip.Other = known.Other;
+        }
+
         _log("READ  | " + row.Label + " | current='" + original + "' | constraints: Min=" + Fmt(tip.Min) + " Max=" + Fmt(tip.Max) + " unit/type=" + tip.TypeToken
-             + (tip.Direction.Length > 0 ? " | must be " + tip.Direction + " than another parameter (" + (tip.Direction == "lower" ? "only the Min limit is typed as a valid value" : "Max is typed as is; Min is typed while the other parameter is temporarily at its minimum") + ")" : ""));
+             + (tip.Direction.Length > 0 ? " | must be " + tip.Direction + " than another parameter (" + (tip.Direction == "lower" ? "Min is typed as is; Max is typed while the other parameter(s) are temporarily at their maximum" : "Max is typed as is; Min is typed while the other parameter(s) are temporarily at their minimum") + ")" : ""));
         if (original.Length == 0)
         {
             _skippedParams++;
@@ -533,6 +548,15 @@ public class ConfigureInputValidationTest
             }
         }
 
+        // developer switch: VALIDATION_PROBE="-50,-60,-100" adds these values to every numeric parameter as inputs that must be REJECTED (to find where a range really ends)
+        if (!isString && Environment.GetEnvironmentVariable("VALIDATION_PROBE") is { Length: > 0 } probes)
+        {
+            foreach (var p in probes.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+            {
+                inputs.Add((p, Expect.Reject, "probe value"));
+            }
+        }
+
         foreach (var (text, expect, what) in inputs)
         {
             // a value that must be ACCEPTED is tried a second time before it counts as a failure (a red X left over from the previous input can look like a rejection)
@@ -552,9 +576,9 @@ public class ConfigureInputValidationTest
             }
         }
 
-        if (tip.Direction == "higher" && tip.Min.HasValue && !_stopRequested && !StopControl.Requested)
+        if (tip.Direction.Length > 0 && !_stopRequested && !StopControl.Requested)
         {
-            CheckMinWithOtherAtItsMinimum(window, row, original, tip);
+            CheckLimitWithOthersAtTheirLimit(window, row, original, tip);
         }
 
         // the original is typed back after every input; make sure the unit really shows it again
@@ -581,6 +605,14 @@ public class ConfigureInputValidationTest
     {
         // a red-X chip left over from the previous input would look like a rejection of this one: start from a clean field
         ClearRejection(window, row);
+
+        // Typing the value the unit ALREADY holds changes nothing: the GUI shows neither the green V nor a red X and the field can stay empty - that looks like a refusal.
+        // (Seen when the original value is the limit itself: Min 0 on a parameter whose default is 0.) A value that must be ACCEPTED and equals the original is therefore
+        // typed after a different valid value, so that the change is real.
+        if (expect == Expect.Accept && SameText(text, original))
+        {
+            NudgeAwayFromOriginal(window, row, original, text, tip);
+        }
 
         string before = ReadAppLog();
         var tb = FindValueElement(window, row)!;
@@ -735,45 +767,71 @@ public class ConfigureInputValidationTest
         return ok;
     }
 
-    // "must be higher than <other>" (Vin1 High Threshold Px vs Vin1 Low Threshold): the Min limit of this parameter can only be accepted while <other> is below it, and
-    // <other> can go no lower than ITS Min - so <other> is set to its Min for this one input, the Min is typed (must be ACCEPTED), and <other> is put back (also on an error).
-    // If the unit refuses Min here (e.g. both Min are 8 and "higher" is strict) it is reported as a failure of the Min input.
-    private void CheckMinWithOtherAtItsMinimum(Window window, Row row, string original, Tip tip)
+    // "must be higher/lower than <other>" (Vin High Thresholds vs Vin Low Threshold, Temp High vs Temp Low): the limit of this parameter that points TOWARDS the other one is only
+    // valid while the other is out of the way - the Min of a "higher" parameter needs the other at ITS Min, the Max of a "lower" parameter needs the other at ITS Max. So the
+    // other parameter(s) are set to that limit for this one input, the limit is typed (must be ACCEPTED) and they are put back (also on an error). When both limits are equal
+    // (Temp: both 130) the unit refuses the value: that is reported as a failure of this input, like the Vin thresholds.
+    private void CheckLimitWithOthersAtTheirLimit(Window window, Row row, string original, Tip tip)
     {
-        var other = _allRows.Where(r => r.Sheet == row.Sheet && r.Channel == row.Channel && tip.Other.StartsWith(r.Name, StringComparison.OrdinalIgnoreCase))
-                            .OrderByDescending(r => r.Name.Length).FirstOrDefault();
-        if (other == null || other.Scope != row.Scope)
+        bool higher = tip.Direction == "higher";
+        string limitName = higher ? "Min" : "Max";
+        double? ownLimit = higher ? tip.Min : tip.Max;
+        if (!ownLimit.HasValue)
         {
-            _log("NOTE  | " + row.Label + " | the Min limit was not checked: the other parameter ('" + tip.Other + "') is not on this page of the sheet");
             return;
         }
 
-        var otherTb = FindValueElement(window, other);
-        string otherOriginal = otherTb == null ? "" : DisplayedValue(window, other, otherTb);
-        var otherTip = otherTb == null ? new Tip() : ReadConstraints(otherTb);
-        if (otherTb == null || otherOriginal.Length == 0 || !otherTip.Min.HasValue)
+        var others = OtherRows(row, tip);
+        if (others.Count == 0 || others.Any(o => o.Scope != row.Scope))
         {
-            _log("NOTE  | " + row.Label + " | the Min limit was not checked: the value or the Min of '" + other.Name + "' could not be read");
+            _log("NOTE  | " + row.Label + " | the " + limitName + " limit was not checked: the other parameter ('" + tip.Other + "') is not on this page of the sheet");
             return;
         }
 
-        string otherMin = Fmt(otherTip.Min);
-        _tempChange = other.Label + " (original '" + otherOriginal + "')";
+        var changed = new List<(Row Row, string Original)>();
+        string otherLimitText = "";
+        var refused = new List<string>();      // the other parameters that refuse their own limit
         try
         {
-            At("setting " + other.Name + " to its minimum " + otherMin);
-            TypeAndEnter(otherTb, otherMin);
-            Thread.Sleep(600);
-            string got = ReadFromUnit(window, other) ?? DisplayedValue(window, other, FindValueElement(window, other) ?? otherTb);
-            if (!SameValue(got, otherMin))
+            foreach (var other in others)
             {
-                _log("WARN  | " + row.Label + " | the Min limit was not checked: " + other.Name + " could not be set to its minimum " + otherMin + " (the unit holds '" + got + "')");
-                return;
+                var otherTb = FindValueElement(window, other);
+                string otherOriginal = otherTb == null ? "" : DisplayedValue(window, other, otherTb);
+                var otherTip = otherTb == null ? new Tip() : ReadConstraints(otherTb);
+                double? otherLimit = higher ? otherTip.Min : otherTip.Max;
+                if (otherTb == null || otherOriginal.Length == 0 || !otherLimit.HasValue)
+                {
+                    _log("NOTE  | " + row.Label + " | the " + limitName + " limit was not checked: the value or the " + (higher ? "Min" : "Max") + " of '" + other.Name + "' could not be read");
+                    return;
+                }
+
+                otherLimitText = Fmt(otherLimit);
+                if (SameValue(otherOriginal, otherLimitText))
+                {
+                    continue;      // already at its limit
+                }
+
+                changed.Add((other, otherOriginal));
+                _tempChange = string.Join(", ", changed.Select(c => c.Row.Label + " (original '" + c.Original + "')"));
+                At("setting " + other.Name + " to its " + (higher ? "minimum " : "maximum ") + otherLimitText);
+                TypeAndEnter(otherTb, otherLimitText);
+                Thread.Sleep(600);
+                string got = ReadFromUnit(window, other) ?? DisplayedValue(window, other, FindValueElement(window, other) ?? otherTb);
+                if (!SameValue(got, otherLimitText))
+                {
+                    // The other parameter refuses ITS OWN limit (Vin1 High Threshold P1 = 85 is refused by the unit): the check goes on - the limit is typed anyway.
+                    // Both limits are equal, so it is most likely refused too, and that is reported as a failure of this input (never silently skipped).
+                    _log("NOTE  | " + row.Label + " | " + other.Name + " could not be set to its " + (higher ? "minimum " : "maximum ") + otherLimitText + " (the unit holds '" + got + "') - the " + limitName + " limit is typed anyway");
+                    ClearRejection(window, other);
+                    refused.Add(other.Name);
+                }
             }
 
-            _log("INFO  | " + row.Label + " | " + other.Name + " temporarily set to its minimum " + otherMin + " (original '" + otherOriginal + "') to check the Min limit");
-            string what = "Min (the limit itself) [" + other.Name + " temporarily set to its minimum " + otherMin + "]";
-            string text = Fmt(tip.Min);
+            string names = string.Join(", ", others.Select(o => o.Name));
+            string what = limitName + " (the limit itself) [" + names + " temporarily set to " + (others.Count > 1 ? "their " : "its ") + (higher ? "minimum" : "maximum") + " " + otherLimitText
+                          + (refused.Count == 0 ? "" : refused.Count == others.Count ? "; the unit refuses " + (others.Count > 1 ? "it for all of them" : "it for it too") : "; refused by the unit for " + string.Join(", ", refused)) + "]";
+            _log("INFO  | " + row.Label + " | " + names + " temporarily set to " + (higher ? "minimum " : "maximum ") + otherLimitText + " to check the " + limitName + " limit");
+            string text = Fmt(ownLimit);
             if (!CheckInput(window, row, original, text, Expect.Accept, what, tip, record: false))
             {
                 _log("NOTE  | " + row.Label + " | " + what + " '" + text + "' was refused - trying once more");
@@ -782,35 +840,86 @@ public class ConfigureInputValidationTest
         }
         finally
         {
-            At("putting " + other.Name + " back");
-            var tb = FindValueElement(window, other);
-            if (tb != null)
+            for (int i = changed.Count - 1; i >= 0; i--)
             {
-                ClearRejection(window, other);
-                TypeAndEnter(FindValueElement(window, other) ?? tb, otherOriginal);
-                WaitForRejectChipGone(window, other, 3000);
-                ClearRejection(window, other);
-            }
-
-            string back = ReadFromUnit(window, other) ?? "";
-            if (!SameValue(back, otherOriginal))
-            {
-                FetchDiscard(window);
-                var again = FindValueElement(window, other);
-                back = again == null ? "" : DisplayedValue(window, other, again);
-            }
-
-            if (!SameValue(back, otherOriginal))
-            {
-                _log("FAIL  | " + other.Label + " | after the Min check of " + row.Name + " it shows '" + back + "' instead of the original '" + otherOriginal + "' - fix it on the unit");
-                AddFinding(new Finding(other, "(restore after the Min check of " + row.Name + ")", "the original value '" + otherOriginal + "'", "unit holds '" + back + "'", "",
-                                       "This parameter was temporarily set to its minimum to check " + row.Name + " and could not be put back: it holds “" + back + "” (original “" + otherOriginal + "”).",
-                                       otherOriginal, otherMin, back));
-                _stopRequested = true;
+                RestoreOther(window, row, changed[i].Row, changed[i].Original, limitName);
             }
 
             _tempChange = "";
         }
+    }
+
+    // Puts a temporarily changed parameter back and checks the unit holds the original again (Fetch if not); a failure to do so is reported and stops the run.
+    private void RestoreOther(Window window, Row row, Row other, string otherOriginal, string limitName)
+    {
+        At("putting " + other.Name + " back");
+        var tb = FindValueElement(window, other);
+        if (tb != null)
+        {
+            ClearRejection(window, other);
+            TypeAndEnter(FindValueElement(window, other) ?? tb, otherOriginal);
+            WaitForRejectChipGone(window, other, 3000);
+            ClearRejection(window, other);
+        }
+
+        string back = ReadFromUnit(window, other) ?? "";
+        if (!SameValue(back, otherOriginal))
+        {
+            FetchDiscard(window);
+            var again = FindValueElement(window, other);
+            back = again == null ? "" : DisplayedValue(window, other, again);
+        }
+
+        if (!SameValue(back, otherOriginal))
+        {
+            _log("FAIL  | " + other.Label + " | after the " + limitName + " check of " + row.Name + " it shows '" + back + "' instead of the original '" + otherOriginal + "' - fix it on the unit");
+            AddFinding(new Finding(other, "(restore after the " + limitName + " check of " + row.Name + ")", "the original value '" + otherOriginal + "'", "unit holds '" + back + "'", "",
+                                   "This parameter was temporarily changed to check " + row.Name + " and could not be put back: it holds “" + back + "” (original “" + otherOriginal + "”).",
+                                   otherOriginal, "", back));
+            _stopRequested = true;
+        }
+    }
+
+    // The parameter(s) a "must be higher/lower than ..." constraint refers to: "Vin1 Low Threshold" (one) or "Vin1 High Threshold P1/P2/P3" (three rows of the same sheet / channel).
+    private List<Row> OtherRows(Row row, Tip tip)
+    {
+        var same = _allRows.Where(r => r.Sheet == row.Sheet && r.Channel == row.Channel).ToList();
+        var many = Regex.Match(tip.Other, @"^(.*?)(\d(?:/[A-Za-z]*\d)+)");      // "Vin1 High Threshold P1/P2/P3" (also "P1/2/3")
+        if (many.Success)
+        {
+            var list = Regex.Matches(many.Groups[2].Value, @"\d").Select(d => same.FirstOrDefault(x => x.Name.Equals(many.Groups[1].Value + d.Value, StringComparison.OrdinalIgnoreCase))).OfType<Row>().ToList();
+            if (list.Count > 0)
+            {
+                return list;
+            }
+        }
+
+        var one = same.Where(r => tip.Other.StartsWith(r.Name, StringComparison.OrdinalIgnoreCase)).OrderByDescending(r => r.Name.Length).FirstOrDefault();
+        return one == null ? new List<Row>() : new List<Row> { one };
+    }
+
+    // Types original+1 (original-1 when +1 is above Max) so that the unit no longer holds 'original'. If that value is refused (a dependent limit), the red X is cleared and
+    // the unit still holds the original - the check then runs as before.
+    private void NudgeAwayFromOriginal(Window window, Row row, string original, string target, Tip tip)
+    {
+        if (!double.TryParse(original, NumberStyles.Float, CultureInfo.InvariantCulture, out double o))
+        {
+            return;
+        }
+
+        double alt = tip.Max.HasValue && o + 1 > tip.Max.Value ? o - 1 : o + 1;
+        string altText = alt.ToString("0.###", CultureInfo.InvariantCulture);
+        var tb = FindValueElement(window, row);
+        if (tb == null)
+        {
+            return;
+        }
+
+        At("typing a different valid value first ('" + altText + "')");
+        _log("INFO  | " + row.Label + " | '" + target + "' is the value the unit already holds - '" + altText + "' is typed first so that typing it is a real change");
+        TypeAndEnter(tb, altText);
+        Thread.Sleep(900);
+        ClearRejection(window, row);
     }
 
     // The red X stays until the row is refreshed: press the row's "Refresh parameter value from unit" button (id = name id + "Refresh").
@@ -844,7 +953,12 @@ public class ConfigureInputValidationTest
     private static string Problem(string what, string text, Expect expect, string expected, string actual)
     {
         string shown = text.Length > 20 ? text.Substring(0, 20) + "..." : text;
-        if (what.StartsWith("Max (", StringComparison.Ordinal)) return "The field does not accept the maximum value (" + shown + ").";
+        if (what.StartsWith("Max (", StringComparison.Ordinal))
+        {
+            int ctx = what.IndexOf('[');      // the condition the value was typed under, see the Min case below
+            return "The field does not accept the maximum value (" + shown + ")" + (ctx >= 0 ? " " + what.Substring(ctx) : "") + ".";
+        }
+
         if (what.StartsWith("Min (", StringComparison.Ordinal))
         {
             int ctx = what.IndexOf('[');      // "[Vin1 Low Threshold temporarily set to its minimum 8]" - the condition the value was typed under
@@ -1338,6 +1452,7 @@ public class ConfigureInputValidationTest
                 report.AddRunSheet(wb, new[]
                 {
                     ("Unit", _unit.Name),
+                    ("Studio DB", _dbInfo.Length > 0 ? _dbInfo : "(not read - the run ended before the GUI was reached)"),
                     ("Rows of this run", _rowsDescription),
                     ("Loop", LoopText),
                 });

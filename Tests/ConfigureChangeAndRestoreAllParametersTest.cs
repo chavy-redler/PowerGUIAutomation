@@ -63,6 +63,7 @@ public class ConfigureChangeAndRestoreAllParametersTest
     // First failure of the run, for the closing "RESULT" explanation.
     private string _failParam = "", _failStep = "", _failWhy = "", _failCheck = "";
     private string _guiVersion = "";
+    private string _dbInfo = "";      // which Studio DB the GUI runs with (see StudioDbInfo), shown in the log and the Run tab
     private readonly Dictionary<int, double> _lastPct = new();      // per scope: scroll position where the previous parameter was found
     private Dictionary<int, List<int>> _scopeRows = new();           // per scope: the Excel rows in list order (position of a row in the page = its index here)
 
@@ -478,6 +479,7 @@ public class ConfigureChangeAndRestoreAllParametersTest
                 report.AddRunSheet(wb, new[]
                 {
                     ("Unit", _unit.Name),
+                    ("Studio DB", _dbInfo.Length > 0 ? _dbInfo : "(not read - the run ended before the GUI was reached)"),
                     ("Rows of this run", _rowsDescription),
                     ("Loop", LoopText),
                 });
@@ -623,6 +625,7 @@ public class ConfigureChangeAndRestoreAllParametersTest
 
         using var automation = new UIA3Automation();
         var window = AppConnection.Attach(automation);
+        _dbInfo = StudioDbInfo.Report(window, _log);
 
         string? unitProblem = VerifyUnit(window);
         if (unitProblem != null)

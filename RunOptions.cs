@@ -91,8 +91,9 @@ public sealed class RowSelection
             Console.WriteLine("   54-70, 72, 100-   = rows 54 to 70, row 72, and row 100 to the end of the sheet");
             Console.WriteLine("   -60               = from the first row up to row 60");
             Console.WriteLine("   a failures file   = only the FAILED rows of an earlier run: drag its .xlsx into this window, or paste its path");
-            Console.WriteLine("                       (the failures files are in: " + RunReport.Dir + ")");
-            Console.Write(" Rows or failures file [Enter = all]: ");
+            Console.WriteLine("                       the failures files are in this folder:");
+            Console.WriteLine("                       " + RunReport.Dir);
+            Console.Write(" Your answer (just press Enter to run all rows): ");
             string? answer = Console.ReadLine();
             string text = (answer ?? "").Trim().Trim('"');
             if (text.Equals("F", StringComparison.OrdinalIgnoreCase))
